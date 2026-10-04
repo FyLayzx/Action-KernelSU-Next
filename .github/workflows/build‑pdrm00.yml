@@ -21,6 +21,7 @@ permissions:
 
 env:
   KERNEL_REPO: https://github.com/FyLayzx/kernel_oneplus_sm8250
+  CLANG_VERSION: clang-r450784e
 
 jobs:
   build:
@@ -42,7 +43,6 @@ jobs:
         run: |
           mkdir -p ${{ github.workspace }}/logs
           echo "Workflow 启动时间: $(date -u)" > ${{ github.workspace }}/logs/summary.log
-          echo "输入: branch=${{ github.event.inputs.KERNEL_BRANCH }}, config=${{ github.event.inputs.KERNEL_CONFIG }}, ksunext=${{ github.event.inputs.KSUNEXT_ENABLED }}" >> ${{ github.workspace }}/logs/summary.log
 
       - name: Install dependencies
         run: |
@@ -50,21 +50,34 @@ jobs:
           sudo apt install -y \
             git make bc bison flex libssl-dev libelf-dev zip curl wget \
             python3 python-is-python3 cpio lz4 xz-utils ccache \
-            android-sdk-libsparse-utils patch
+            android-sdk-libsparse-utils patch clang lld
 
-      - name: Download toolchain (proton-clang)
+      - name: Download AOSP Clang
         run: |
           LOG=${{ github.workspace }}/logs/toolchain.log
-          git clone --depth=1 https://github.com/kdrag0n/proton-clang clang 2>&1 | tee $LOG
+          echo "=== 下载 AOSP Clang ${{ env.CLANG_VERSION }} ===" | tee $LOG
+          # 从 AOSP 官方仓库下载指定版本的 Clang 工具链
+          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-13.0.0_r3/${{ env.CLANG_VERSION }}.tar.gz" -O clang.tar.gz 2>&1 | tee -a $LOG
+          if [ ! -s clang.tar.gz ]; then
+            echo "⚠ 官方 archive 下载失败，尝试备用地址..." | tee -a $LOG
+            # 备用：从其他镜像获取
+            wget -q "https://github.com/ZyCromerZ/Clang/releases/download/${{ env.CLANG_VERSION }}/${{ env.CLANG_VERSION }}.tar.gz" -O clang.tar.gz 2>&1 | tee -a $LOG
+          fi
+          mkdir -p clang
+          tar -xzf clang.tar.gz -C clang 2>&1 | tee -a $LOG
           echo "CLANG_PATH=$PWD/clang/bin" >> "$GITHUB_ENV"
+          echo "=== Clang 版本验证 ===" | tee -a $LOG
           $PWD/clang/bin/clang --version 2>&1 | tee -a $LOG
+          echo "=== ld.lld 验证 ===" | tee -a $LOG
+          $PWD/clang/bin/ld.lld --version 2>&1 | tee -a $LOG
 
       - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-pdrm00
-          restore-keys: ccache-pdrm00
+          key: ccache-pdrm00-${{ env.CLANG_VERSION }}
+          restore-keys: |
+            ccache-pdrm00-
 
       - name: Clone kernel source
         run: |
@@ -113,9 +126,6 @@ jobs:
           echo "" | tee -a $LOG
           echo "=== 搜索 Kbuild 里 MANUAL_HOOK / KPROBES 引用 ===" | tee -a $LOG
           grep -n "MANUAL_HOOK\|KPROBES_HOOK\|No hooks" drivers/kernelsu/Kbuild 2>&1 | tee -a $LOG || echo "无匹配" | tee -a $LOG
-          echo "" | tee -a $LOG
-          echo "=== drivers/kernelsu/Kconfig 里 KSU 配置项 ===" | tee -a $LOG
-          grep -n "config KSU" drivers/kernelsu/Kconfig 2>&1 | tee -a $LOG
 
       - name: Patch defconfig for Manual Hooks
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
@@ -142,16 +152,24 @@ jobs:
           CLANG_TRIPLE: aarch64-linux-gnu-
           CROSS_COMPILE: aarch64-linux-gnu-
           CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
+          # 明确指定使用下载的 LLVM 工具链
+          LLVM: 1
+          LLVM_IAS: 1
         run: |
           set -o pipefail
           LOG=${{ github.workspace }}/logs/compile.log
           cd kernel
           export PATH="$CLANG_PATH:$PATH"
 
-          echo "===== [1/3] 清理旧 out 目录（不使用 mrproper）=====" | tee $LOG
+          echo "===== [0/4] 构建主机工具 fixdep =====" | tee $LOG
+          make O=out ARCH=arm64 CC="ccache clang" scripts_basic 2>&1 | tee -a $LOG || {
+            echo "❌ fixdep 构建失败" | tee -a $LOG; exit 1;
+          }
+
+          echo "===== [1/4] 清理旧 out 目录 =====" | tee -a $LOG
           rm -rf out
 
-          echo "===== [2/3] defconfig: ${{ env.DEFCONFIG }} =====" | tee -a $LOG
+          echo "===== [2/4] defconfig: ${{ env.DEFCONFIG }} =====" | tee -a $LOG
           make O=out ARCH=arm64 CC="ccache clang" ${{ env.DEFCONFIG }} 2>&1 | tee -a $LOG || {
             echo "❌ defconfig 步骤失败" | tee -a $LOG; exit 1;
           }
@@ -159,7 +177,7 @@ jobs:
           echo "=== 确认 KSU 配置已写入 out/.config ===" | tee -a $LOG
           grep -E "KSU|KPROBES" out/.config | tee -a $LOG || echo "⚠ out/.config 中未找到 KSU 配置" | tee -a $LOG
 
-          echo "===== [3/3] 编译内核 =====" | tee -a $LOG
+          echo "===== [3/4] 编译内核 =====" | tee -a $LOG
           make O=out ARCH=arm64 -j$(nproc) \
             CC="ccache clang" LLVM=1 LLVM_IAS=1 2>&1 | tee -a $LOG
           STATUS=${PIPESTATUS[0]}
