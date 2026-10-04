@@ -96,7 +96,8 @@ jobs:
           ls -la drivers/kernelsu 2>&1 | head -3
 
       # ============================================================
-      # 修复 1: register_trace_sys_enter 去掉第 3 个参数 INT_MIN
+      # 修复 1: register_trace_sys_enter / unregister_trace_sys_enter
+      #          删掉第 3 个参数（INT_MIN），4.19 内核只接受 2 个参数
       # ============================================================
       - name: Fix register_trace_sys_enter arguments
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
@@ -116,13 +117,9 @@ jobs:
               echo "--- 修复前 ---"
               grep -n "register_trace_sys_enter\|unregister_trace_sys_enter" "$f" || echo "  (无匹配)"
 
-              # 1. 去掉 register_trace_sys_enter 的第 3 个参数（, INT_MIN 或 , 数字）
-              #    例：register_trace_sys_enter(ksu_sys_enter_handler, NULL, INT_MIN)
-              #    → register_trace_sys_enter(ksu_sys_enter_handler, NULL)
-              sed -i -E 's/(register_trace_sys_enter\([^,]+,[^,)]+),\s*[^)]+\)/\1)/g' "$f"
-
-              # 2. 同样处理 unregister
-              sed -i -E 's/(unregister_trace_sys_enter\([^,]+,[^,)]+),\s*[^)]+\)/\1)/g' "$f"
+              # 删除 register_trace_sys_enter(...) 的第 3 个参数（, INT_MIN 或 , 数字）
+              sed -i -E 's/(register_trace_sys_enter\([^,]+,[^,]+),[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*\)/\1)/g' "$f"
+              sed -i -E 's/(unregister_trace_sys_enter\([^,]+,[^,]+),[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*\)/\1)/g' "$f"
 
               echo "--- 修复后 ---"
               grep -n "register_trace_sys_enter\|unregister_trace_sys_enter" "$f" || echo "  (无匹配)"
@@ -132,6 +129,7 @@ jobs:
 
       # ============================================================
       # 修复 2: strscpy_pad 版本门槛
+      #          4.19 内核没有 strscpy_pad，强制走手动实现分支
       # ============================================================
       - name: Fix strscpy_pad version gate
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
