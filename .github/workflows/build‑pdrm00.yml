@@ -95,6 +95,107 @@ jobs:
           echo "=== 探测 kernelsu 源码位置 ==="
           ls -la drivers/kernelsu 2>&1 | head -3
 
+      # ============================================================
+      # 【新增】预扫描 - 一次性找出所有可能的 4.19 API 缺失
+      # ============================================================
+      - name: Pre-scan kernelsu for 4.19-incompatible symbols
+        if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
+        run: |
+          cd kernel
+          echo "################################################################"
+          echo "#                                                              #"
+          echo "#  预扫描：检查 kernelsu 里引用的 4.19 可能缺失的符号             #"
+          echo "#                                                              #"
+          echo "################################################################"
+          echo ""
+
+          # 内核版本确认
+          KVER=$(make kernelversion 2>/dev/null || echo "unknown")
+          echo "当前内核版本: $KVER"
+          echo ""
+
+          # 分类扫描的符号列表
+          echo "=============================================================="
+          echo "# 类别 1: 字符串/内存相关 API（5.4+ 才引入）"
+          echo "=============================================================="
+          for sym in strscpy_pad memdup_user_nul kvcalloc kvmalloc_array \
+                     kvmalloc_node vmalloc_array __vmalloc_array; do
+            echo "--- $sym ---"
+            HITS=$(grep -rln "\b$sym\b" drivers/kernelsu/ KernelSU-Next/ 2>/dev/null | head -10)
+            if [ -n "$HITS" ]; then echo "$HITS"; else echo "  (无引用)"; fi
+          done
+          echo ""
+
+          echo "=============================================================="
+          echo "# 类别 2: tracepoint / kprobe API"
+          echo "=============================================================="
+          for sym in register_trace_prio_sys_enter unregister_trace_prio_sys_enter \
+                     register_trace_sys_enter unregister_trace_sys_enter \
+                     register_kprobe_sched_switch; do
+            echo "--- $sym ---"
+            HITS=$(grep -rln "\b$sym\b" drivers/kernelsu/ KernelSU-Next/ 2>/dev/null | head -10)
+            if [ -n "$HITS" ]; then echo "$HITS"; else echo "  (无引用)"; fi
+          done
+          echo ""
+
+          echo "=============================================================="
+          echo "# 类别 3: KSU 自定义 hook 函数（kernelsu → 内核）"
+          echo "=============================================================="
+          for sym in ksu_handle_seccomp ksu_handle_setuid ksu_handle_setresuid \
+                     ksu_handle_input_handle_event ksu_handle_execve \
+                     ksu_handle_faccessat ksu_handle_stat ksu_handle_vfs_fstat \
+                     ksu_handle_sys_reboot; do
+            echo "--- $sym ---"
+            HITS=$(grep -rln "\b$sym\b" drivers/kernelsu/ KernelSU-Next/ 2>/dev/null | head -10)
+            if [ -n "$HITS" ]; then echo "$HITS"; else echo "  (无引用)"; fi
+          done
+          echo ""
+
+          echo "=============================================================="
+          echo "# 类别 4: 进程/任务相关 API（4.19 vs 5.4 差异大）"
+          echo "=============================================================="
+          for sym in task_work_add task_work_cancel task_work_run \
+                     get_task_exe_file mmget_still_valid mmput_async \
+                     is_dumpable set_dumpable __set_task_comm; do
+            echo "--- $sym ---"
+            HITS=$(grep -rln "\b$sym\b" drivers/kernelsu/ KernelSU-Next/ 2>/dev/null | head -10)
+            if [ -n "$HITS" ]; then echo "$HITS"; else echo "  (无引用)"; fi
+          done
+          echo ""
+
+          echo "=============================================================="
+          echo "# 类别 5: 其他 5.x API"
+          echo "=============================================================="
+          for sym in override_creds revert_creds creds_are_... \
+                     ns_capable_noaudit task_active_pid_ns \
+                     __close_fd close_fd filp_close fput; do
+            echo "--- $sym ---"
+            HITS=$(grep -rln "\b$sym\b" drivers/kernelsu/ KernelSU-Next/ 2>/dev/null | head -10)
+            if [ -n "$HITS" ]; then echo "$HITS"; else echo "  (无引用)"; fi
+          done
+          echo ""
+
+          echo "=============================================================="
+          echo "# 类别 6: 宏 / 常量定义"
+          echo "=============================================================="
+          for sym in TWA_RESUME TWA_SIGNAL TWA_NONE TWA_NMI_CURRENT \
+                     KSU_COMPAT_USE_...; do
+            echo "--- $sym ---"
+            HITS=$(grep -rln "\b$sym\b" drivers/kernelsu/ KernelSU-Next/ 2>/dev/null | head -10)
+            if [ -n "$HITS" ]; then echo "$HITS"; else echo "  (无引用)"; fi
+          done
+          echo ""
+
+          echo "=============================================================="
+          echo "# 类别 7: 内核版本判断（找出所有 LINUX_VERSION_CODE 判断）"
+          echo "=============================================================="
+          grep -rn "LINUX_VERSION_CODE" drivers/kernelsu/compat/ 2>/dev/null | head -40 || echo "  (无)"
+          echo ""
+
+          echo "############################################################"
+          echo "#  预扫描结束"
+          echo "############################################################"
+
       # ── 修复 1: register_trace_prio_sys_enter ─────────────
       - name: Fix register_trace_prio_sys_enter for 4.19
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
@@ -102,30 +203,21 @@ jobs:
           cd kernel
           echo "######## 修复 register_trace_prio_sys_enter ########"
 
-          # 查找 hook_manager.c（跟随符号链接）
           TARGET_FILES=$(find -L . -path '*kernelsu*' -name 'hook_manager.c' 2>/dev/null)
           if [ -z "$TARGET_FILES" ]; then
-            echo "⚠ 未找到 hook_manager.c，可能 KernelSU-Next 版本较新无需此修复"
+            echo "⚠ 未找到 hook_manager.c"
           else
             echo "$TARGET_FILES" | while read -r f; do
               [ -f "$f" ] || continue
-              echo ""
               echo "=== 处理: $f ==="
-
-              echo "--- 修复前搜索 prio_sys_enter ---"
               grep -n "prio_sys_enter" "$f" || echo "  (无匹配)"
-
-              # 替换为 4.19 内核支持的版本（去掉 prio）
               sed -i 's/\bregister_trace_prio_sys_enter\b/register_trace_sys_enter/g' "$f"
               sed -i 's/\bunregister_trace_prio_sys_enter\b/unregister_trace_sys_enter/g' "$f"
-
-              echo "--- 修复后搜索 prio_sys_enter ---"
-              grep -n "prio_sys_enter" "$f" || echo "  (无残留，修复成功)"
+              echo "--- 修复后 ---"
+              grep -n "prio_sys_enter" "$f" || echo "  (无残留)"
             done
           fi
-
-          echo ""
-          echo "######## 修复 register_trace_prio_sys_enter 完成 ########"
+          echo "######## 完成 ########"
 
       # ── 修复 2: strscpy_pad 版本门槛 ──────────────────────
       - name: Fix strscpy_pad version gate
@@ -141,21 +233,11 @@ jobs:
           fi
 
           echo "$COMPAT_FILES" | while read -r f; do
-            echo ""
             echo "=== 处理: $f ==="
-
-            echo "--- 修改前（第 85-100 行）---"
-            sed -n '85,100p' "$f" | cat -n
-
-            # 强制 4.19 内核走 #elif 分支（手动 padding 实现）
             sed -i 's/LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 222)/LINUX_VERSION_CODE >= KERNEL_VERSION(99, 99, 99)/g' "$f"
-
-            echo "--- 修改后（第 85-100 行）---"
             sed -n '85,100p' "$f" | cat -n
           done
-
-          echo ""
-          echo "######## 修复 strscpy_pad 完成 ########"
+          echo "######## 完成 ########"
 
       - name: Patch defconfig
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
@@ -218,16 +300,14 @@ jobs:
           echo "=== [2/3] 编译日志最后 200 行 ==="
           tail -200 ${{ github.workspace }}/compile.log || true
           echo ""
-          echo "=== [3/3] kernelsu 相关文件修复状态 ==="
+          echo "=== [3/3] kernelsu 关键文件状态 ==="
           echo "--- hook_manager.c 第 395-410 行 ---"
           find -L kernel -path '*kernelsu*' -name 'hook_manager.c' 2>/dev/null | while read -r f; do
-            echo "文件: $f"
             sed -n '395,410p' "$f" | cat -n
           done
           echo ""
           echo "--- kernel_compat.h 第 85-100 行 ---"
           find -L kernel -name 'kernel_compat.h' 2>/dev/null | while read -r f; do
-            echo "文件: $f"
             sed -n '85,100p' "$f" | cat -n
           done
           echo ""
