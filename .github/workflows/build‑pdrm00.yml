@@ -1,4 +1,4 @@
-name: Build pdrm00 SM8250-4.19 KernelSU-Next (Debug)
+name: Build pdrm00 SM8250-4.19 KernelSU-Next
 
 on:
   workflow_dispatch:
@@ -42,6 +42,7 @@ jobs:
         run: |
           mkdir -p ${{ github.workspace }}/logs
           echo "Workflow 启动时间: $(date -u)" > ${{ github.workspace }}/logs/summary.log
+          echo "输入: branch=${{ github.event.inputs.KERNEL_BRANCH }}, config=${{ github.event.inputs.KERNEL_CONFIG }}, ksunext=${{ github.event.inputs.KSUNEXT_ENABLED }}" >> ${{ github.workspace }}/logs/summary.log
 
       - name: Install dependencies
         run: |
@@ -49,20 +50,7 @@ jobs:
           sudo apt install -y \
             git make bc bison flex libssl-dev libelf-dev zip curl wget \
             python3 python-is-python3 cpio lz4 xz-utils ccache \
-            android-sdk-libsparse-utils
-
-      - name: Probe remote branches
-        run: |
-          LOG=${{ github.workspace }}/logs/branches.log
-          echo "=== 仓库远程分支 ===" | tee $LOG
-          git ls-remote --heads ${{ env.KERNEL_REPO }} 2>&1 | tee -a $LOG
-
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-pdrm00
-          restore-keys: ccache-pdrm00
+            android-sdk-libsparse-utils patch
 
       - name: Download toolchain (proton-clang)
         run: |
@@ -71,14 +59,22 @@ jobs:
           echo "CLANG_PATH=$PWD/clang/bin" >> "$GITHUB_ENV"
           $PWD/clang/bin/clang --version 2>&1 | tee -a $LOG
 
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-pdrm00
+          restore-keys: ccache-pdrm00
+
       - name: Clone kernel source
         run: |
           LOG=${{ github.workspace }}/logs/clone.log
           git clone ${{ env.KERNEL_REPO }} kernel \
             --branch ${{ github.event.inputs.KERNEL_BRANCH }} --depth=1 2>&1 | tee $LOG
-          echo "=== 源码树结构 ===" | tee -a $LOG
+          echo "=== 源码树根目录 ===" | tee -a $LOG
           ls -la kernel/ | tee -a $LOG
-          find kernel/arch/arm64/configs -name '*defconfig*' 2>&1 | tee -a $LOG
+          echo "=== vendor defconfig 列表 ===" | tee -a $LOG
+          ls -la kernel/arch/arm64/configs/vendor/ | tee -a $LOG
 
       - name: Locate defconfig
         run: |
@@ -92,6 +88,8 @@ jobs:
             echo "✓ 找到: arch/arm64/configs/vendor/$DEFCONFIG_INPUT" | tee $LOG
           else
             echo "✗ 未找到 $DEFCONFIG_INPUT" | tee $LOG
+            echo "=== 可用列表 ===" | tee -a $LOG
+            find kernel/arch/arm64/configs -name '*defconfig*' | tee -a $LOG
             exit 1
           fi
 
@@ -100,9 +98,24 @@ jobs:
         run: |
           LOG=${{ github.workspace }}/logs/ksunext.log
           cd kernel
-          echo "=== 集成 KernelSU-Next ===" | tee $LOG
+          echo "=== 集成 KernelSU-Next (legacy) ===" | tee $LOG
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy 2>&1 | tee -a $LOG
+          echo "=== drivers/kernelsu 内容 ===" | tee -a $LOG
           ls -la drivers/kernelsu/ 2>&1 | tee -a $LOG
+
+      - name: Inspect Kbuild hook requirement
+        if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
+        run: |
+          LOG=${{ github.workspace }}/logs/kbuild_check.log
+          cd kernel
+          echo "=== drivers/kernelsu/Kbuild 第 150-180 行 ===" | tee $LOG
+          sed -n '150,180p' drivers/kernelsu/Kbuild 2>&1 | tee -a $LOG
+          echo "" | tee -a $LOG
+          echo "=== 搜索 Kbuild 里 MANUAL_HOOK / KPROBES 引用 ===" | tee -a $LOG
+          grep -n "MANUAL_HOOK\|KPROBES_HOOK\|No hooks" drivers/kernelsu/Kbuild 2>&1 | tee -a $LOG || echo "无匹配" | tee -a $LOG
+          echo "" | tee -a $LOG
+          echo "=== drivers/kernelsu/Kconfig 里 KSU 配置项 ===" | tee -a $LOG
+          grep -n "config KSU" drivers/kernelsu/Kconfig 2>&1 | tee -a $LOG
 
       - name: Patch defconfig for Manual Hooks
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
@@ -110,16 +123,15 @@ jobs:
           LOG=${{ github.workspace }}/logs/patch_defconfig.log
           cd kernel
           DEFCONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG }}"
-          echo "=== 注入 Manual Hooks 配置到 $DEFCONFIG_FILE ===" | tee $LOG
+          echo "=== 注入 KSU 配置到 $DEFCONFIG_FILE ===" | tee $LOG
           {
             echo ""
-            echo "# KernelSU-Next Manual Hooks (added by CI)"
+            echo "# KernelSU-Next Manual Hooks (CI added)"
             echo "CONFIG_KSU=y"
             echo "CONFIG_KSU_MANUAL_HOOK=y"
-            echo "# CONFIG_KSU_KPROBES_HOOK is not set"
           } >> "$DEFCONFIG_FILE"
-          echo "=== 追加后文件末尾 ===" | tee -a $LOG
-          tail -20 "$DEFCONFIG_FILE" | tee -a $LOG
+          echo "=== 文件末尾 10 行 ===" | tee -a $LOG
+          tail -10 "$DEFCONFIG_FILE" | tee -a $LOG
 
       - name: Compile kernel
         id: compile
@@ -136,16 +148,16 @@ jobs:
           cd kernel
           export PATH="$CLANG_PATH:$PATH"
 
-          echo "===== [1/3] mrproper =====" | tee $LOG
-          make O=out ARCH=arm64 CC="ccache clang" mrproper 2>&1 | tee -a $LOG || { echo "mrproper 失败"; exit 1; }
+          echo "===== [1/3] 清理旧 out 目录（不使用 mrproper）=====" | tee $LOG
+          rm -rf out
 
           echo "===== [2/3] defconfig: ${{ env.DEFCONFIG }} =====" | tee -a $LOG
           make O=out ARCH=arm64 CC="ccache clang" ${{ env.DEFCONFIG }} 2>&1 | tee -a $LOG || {
             echo "❌ defconfig 步骤失败" | tee -a $LOG; exit 1;
           }
 
-          echo "=== 确认 Manual Hooks 配置生效 ===" | tee -a $LOG
-          grep -E "KSU|KPROBES" out/.config | tee -a $LOG
+          echo "=== 确认 KSU 配置已写入 out/.config ===" | tee -a $LOG
+          grep -E "KSU|KPROBES" out/.config | tee -a $LOG || echo "⚠ out/.config 中未找到 KSU 配置" | tee -a $LOG
 
           echo "===== [3/3] 编译内核 =====" | tee -a $LOG
           make O=out ARCH=arm64 -j$(nproc) \
@@ -157,14 +169,13 @@ jobs:
           fi
           echo "✓ 内核编译成功" | tee -a $LOG
 
-      # ======== 新增：编译失败时直接输出日志到控制台 ========
       - name: Print compile log on failure
         if: steps.compile.outcome == 'failure'
         run: |
           echo "============================================================"
-          echo "  编译失败，以下是 compile.log 最后 300 行："
+          echo "  编译失败，下面是 compile.log 最后 400 行："
           echo "============================================================"
-          tail -300 ${{ github.workspace }}/logs/compile.log
+          tail -400 ${{ github.workspace }}/logs/compile.log
           echo "============================================================"
           echo "  日志结束"
           echo "============================================================"
@@ -174,10 +185,59 @@ jobs:
         if: always()
         run: |
           LOG=${{ github.workspace }}/logs/artifacts.log
-          echo "=== 编译产物路径检查 ===" | tee $LOG
+          echo "=== 编译产物检查 ===" | tee $LOG
           ls -la kernel/out/arch/arm64/boot/ 2>&1 | tee -a $LOG
-          find kernel/out -name '*.dtb' 2>&1 | tee -a $LOG
-          find kernel/out -name '*.dtbo' 2>&1 | tee -a $LOG
+          echo "--- 所有 dtb ---" | tee -a $LOG
+          find kernel/out -name '*.dtb' 2>&1 | tee -a $LOG | head -50
+          echo "--- 所有 dtbo ---" | tee -a $LOG
+          find kernel/out -name '*.dtbo' 2>&1 | tee -a $LOG | head -50
+
+      - name: Package AnyKernel3
+        if: steps.compile.outcome == 'success'
+        run: |
+          set -o pipefail
+          LOG=${{ github.workspace }}/logs/package.log
+          git clone https://github.com/osm0sis/AnyKernel3 --depth=1 2>&1 | tee $LOG
+          rm -rf AnyKernel3/.git AnyKernel3/.github
+          cat > AnyKernel3/anykernel.sh <<'EOF'
+          properties() { '
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=kebab
+          device.name2=instantnoodle
+          device.name3=instantnoodlep
+          supported.versions=
+          supported.patchlevels=
+          '; }
+          block=boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          EOF
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
+          mkdir -p AnyKernel3/dtb
+          find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} AnyKernel3/dtb/ \; 2>&1 | tee -a $LOG
+          cd AnyKernel3
+          zip -r9 ../AnyKernel3-pdrm00.zip . -x '*.git*' 2>&1 | tee -a $LOG
+
+      - name: Generate dtbo.img
+        if: steps.compile.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          LOG=${{ github.workspace }}/logs/dtbo.log
+          mkdir -p dtbo-out
+          DTBO_FILES=$(find kernel/out/arch/arm64/boot/dts -name '*.dtbo' 2>/dev/null | head -50)
+          if [ -z "$DTBO_FILES" ]; then
+            DTBO_FILES=$(find kernel/out/arch/arm64/boot/dts/qcom -name '*.dtb' 2>/dev/null | head -50)
+          fi
+          echo "$DTBO_FILES" | tee $LOG
+          if [ -n "$DTBO_FILES" ]; then
+            mkdtimg create dtbo-out/dtbo.img --page_size=4096 $DTBO_FILES 2>&1 | tee -a $LOG
+            cd dtbo-out && zip -r9 ../dtbo-pdrm00.zip dtbo.img 2>&1 | tee -a $LOG
+          fi
 
       - name: Upload build logs
         if: always()
@@ -187,3 +247,34 @@ jobs:
           path: logs/
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Upload AnyKernel3 zip
+        if: steps.compile.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3-pdrm00
+          path: AnyKernel3-pdrm00.zip
+          if-no-files-found: error
+
+      - name: Upload dtbo zip
+        if: steps.compile.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtbo-pdrm00
+          path: dtbo-pdrm00.zip
+          if-no-files-found: warn
+
+      - name: Upload raw Image
+        if: steps.compile.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-Image-pdrm00
+          path: kernel/out/arch/arm64/boot/Image
+          if-no-files-found: error
+
+      - name: Fail if compile failed
+        if: steps.compile.outcome == 'failure'
+        run: |
+          echo "编译失败。请复制上面 Print compile log on failure 步骤的输出发我。"
+          exit 1
