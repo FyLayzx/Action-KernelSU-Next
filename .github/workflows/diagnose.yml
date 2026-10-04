@@ -1,0 +1,242 @@
+name: Diagnose KernelSU-Next Hooks for OOS13.1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_REPO: https://github.com/FyLayzx/kernel_oneplus_sm8250
+  KERNEL_BRANCH: OOS13.1
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 4096
+          temp-reserve-mb: 1024
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Install minimal deps
+        run: |
+          sudo apt update -y
+          sudo apt install -y git curl patch
+
+      # ============================================================
+      # 1. Clone 内核源码
+      # ============================================================
+      - name: Clone kernel source
+        run: |
+          git clone ${{ env.KERNEL_REPO }} kernel --branch ${{ env.KERNEL_BRANCH }} --depth=1
+
+      # ============================================================
+      # 2. 集成 KernelSU-Next（legacy 模式）
+      # ============================================================
+      - name: Integrate KernelSU-Next (legacy)
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          echo "=== 集成完成 ==="
+
+      # ============================================================
+      # 3. 【关键】打印 Kbuild 的全部内容
+      #    这样我能看到第 171 行的完整逻辑
+      # ============================================================
+      - name: DUMP Kbuild (full)
+        run: |
+          echo "############################################################"
+          echo "#  drivers/kernelsu/Kbuild 全文"
+          echo "############################################################"
+          cat -n kernel/drivers/kernelsu/Kbuild
+          echo "############################################################"
+          echo "#  Kbuild 结束"
+          echo "############################################################"
+
+      # ============================================================
+      # 4. 打印 Kconfig，看有哪些配置项
+      # ============================================================
+      - name: DUMP Kconfig
+        run: |
+          echo "############################################################"
+          echo "#  drivers/kernelsu/Kconfig 全文"
+          echo "############################################################"
+          cat -n kernel/drivers/kernelsu/Kconfig
+          echo "############################################################"
+
+      # ============================================================
+      # 5. 在 ksu 源码里搜索 hook 相关的定义
+      #    找到 Kbuild 检查的变量到底在哪定义
+      # ============================================================
+      - name: Search hook definitions in ksu source
+        run: |
+          cd kernel/drivers/kernelsu
+          echo "############################################################"
+          echo "#  搜索 MANUAL_HOOK / KPROBES_HOOK / KSU_HOOK / HAS_HOOK"
+          echo "############################################################"
+          grep -rn "MANUAL_HOOK\|KPROBES_HOOK\|KSU_HOOK\|HAS_HOOK\|NO_HOOK" \
+            --include="*.c" --include="*.h" --include="Kbuild" --include="Kconfig" \
+            . | head -100
+          echo ""
+          echo "############################################################"
+          echo "#  搜索 KSU_HOOK 相关的 #ifdef / #if 宏"
+          echo "############################################################"
+          grep -rn "KSU_MANUAL_HOOK\|KSU_KPROBES_HOOK" --include="*.h" . | head -50
+
+      # ============================================================
+      # 6. 在内核源码里检查手动钩子是否已存在
+      #    （如果存在，说明源码本身已适配，不需要打补丁）
+      # ============================================================
+      - name: Check existing hooks in kernel source
+        run: |
+          cd kernel
+          echo "############################################################"
+          echo "#  检查内核源码中是否已存在 ksu_handle_* 调用"
+          echo "############################################################"
+          for f in fs/exec.c kernel/reboot.c fs/stat.c fs/read_write.c fs/open.c; do
+            echo ""
+            echo "--- $f ---"
+            grep -n "ksu_handle" "$f" 2>/dev/null || echo "  （未找到 ksu_handle）"
+          done
+          echo ""
+          echo "############################################################"
+          echo "#  全局搜索 ksu_handle_ 函数调用"
+          echo "############################################################"
+          grep -rn "ksu_handle_" --include="*.c" --include="*.h" . 2>/dev/null | head -30
+
+      # ============================================================
+      # 7. 下载官方 syscall hooks 补丁
+      # ============================================================
+      - name: Download official syscall hooks patch
+        run: |
+          echo "############################################################"
+          echo "#  下载官方 min_scope_syscall_hooks_v1.4.patch"
+          echo "############################################################"
+          curl -LSs "https://github.com/KernelSU-Next/kernel_patches/raw/main/syscall_hook/min_scope_syscall_hooks_v1.4.patch" \
+            -o /tmp/ksu_hooks.patch
+          echo "=== 下载完成，大小: $(wc -c < /tmp/ksu_hooks.patch) 字节 ==="
+          echo ""
+          echo "############################################################"
+          echo "#  补丁中涉及的文件列表"
+          echo "############################################################"
+          grep -E "^\+\+\+ " /tmp/ksu_hooks.patch || echo "补丁格式异常"
+
+      # ============================================================
+      # 8. 尝试应用补丁，打印详细结果
+      # ============================================================
+      - name: Try apply patch (dry run)
+        run: |
+          cd kernel
+          echo "############################################################"
+          echo "#  git apply --check（预检，不实际改动）"
+          echo "############################################################"
+          git apply --check /tmp/ksu_hooks.patch
+          echo "=== 预检结果: exit=$? ==="
+          echo ""
+          echo "############################################################"
+          echo "#  patch --dry-run（预检）"
+          echo "############################################################"
+          patch -p1 --dry-run < /tmp/ksu_hooks.patch || true
+
+      # ============================================================
+      # 9. 真正应用补丁（不使用 git apply，因为会整体回滚）
+      #    使用 patch -p1 并允许部分失败
+      # ============================================================
+      - name: Actually apply patch (allow partial)
+        continue-on-error: true
+        run: |
+          cd kernel
+          echo "############################################################"
+          echo "#  实际应用补丁（patch -p1，允许部分成功）"
+          echo "############################################################"
+          patch -p1 < /tmp/ksu_hooks.patch || true
+          echo ""
+          echo "############################################################"
+          echo "#  应用后的 .rej 文件列表（被拒绝的 hunk）"
+          echo "############################################################"
+          find . -name '*.rej' -type f | while read f; do
+            echo ""
+            echo "============================================================"
+            echo "  被拒绝的 hunk: $f"
+            echo "============================================================"
+            cat -n "$f"
+          done
+          echo ""
+          echo "############################################################"
+          echo "#  如果 .rej 为空，说明补丁全部应用成功"
+          echo "############################################################"
+
+      # ============================================================
+      # 10. 验证钩子函数是否已插入
+      # ============================================================
+      - name: Verify hooks after patch
+        run: |
+          cd kernel
+          echo "############################################################"
+          echo "#  补丁后钩子函数验证"
+          echo "############################################################"
+          for f in fs/exec.c kernel/reboot.c fs/stat.c fs/read_write.c fs/open.c; do
+            echo ""
+            echo "--- $f ---"
+            grep -n "ksu_handle" "$f" 2>/dev/null || echo "  ❌ 未找到 ksu_handle"
+          done
+
+      # ============================================================
+      # 11. 打印 Kbuild 在打了补丁之后，还是否会报错
+      #     手动触发 Kbuild:171 那段逻辑
+      # ============================================================
+      - name: Check what Kbuild:171 checks
+        run: |
+          cd kernel/drivers/kernelsu
+          echo "############################################################"
+          echo "#  Kbuild 第 160-180 行（上下文）"
+          echo "############################################################"
+          sed -n '155,185p' Kbuild | cat -n
+          echo ""
+          echo "############################################################"
+          echo "#  Kbuild 里所有 ifeq / ifdef / ifndef 附近的 KSU 变量"
+          echo "############################################################"
+          grep -n "ifeq\|ifdef\|ifndef\|KSU" Kbuild | head -60
+
+      # ============================================================
+      # 12. 最终总结
+      # ============================================================
+      - name: FINAL SUMMARY
+        if: always()
+        run: |
+          echo "============================================================"
+          echo "                     诊断总结"
+          echo "============================================================"
+          echo ""
+          echo "1) 官方补丁是否成功应用？"
+          if [ -f kernel/fs/exec.c ]; then
+            if grep -q "ksu_handle_execve" kernel/fs/exec.c; then
+              echo "   ✅ fs/exec.c 中已包含 ksu_handle_execve"
+            else
+              echo "   ❌ fs/exec.c 中未包含 ksu_handle_execve"
+            fi
+            if grep -q "ksu_handle_sys_reboot" kernel/kernel/reboot.c 2>/dev/null; then
+              echo "   ✅ kernel/reboot.c 中已包含 ksu_handle_sys_reboot"
+            else
+              echo "   ❌ kernel/reboot.c 中未包含 ksu_handle_sys_reboot"
+            fi
+          fi
+          echo ""
+          echo "2) 被拒绝的 hunk 数量:"
+          find kernel -name '*.rej' 2>/dev/null | wc -l
+          echo ""
+          echo "3) 请把上面这几段输出复制给我:"
+          echo "   - DUMP Kbuild 全文"
+          echo "   - DUMP Kconfig 全文"
+          echo "   - Search hook definitions 的输出"
+          echo "   - Actually apply patch 部分的 .rej 内容"
+          echo "   - FINAL SUMMARY"
+          echo "============================================================"
