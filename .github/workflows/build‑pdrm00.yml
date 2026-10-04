@@ -15,6 +15,14 @@ on:
         description: 启用 KernelSU-Next
         type: boolean
         default: true
+      KSU_HOOK_MODE:
+        description: KSU hook 模式
+        required: true
+        type: choice
+        options:
+          - kprobes
+          - manual
+        default: kprobes
 
 permissions:
   contents: read
@@ -46,23 +54,20 @@ jobs:
             python3 python-is-python3 cpio lz4 xz-utils ccache \
             android-sdk-libsparse-utils patch
 
-      # ── 下载 AOSP Clang（修正版） ───────────────────────
+      # ── Clang 工具链 ─────────────────────────────────────
       - name: Download AOSP Clang
         run: |
           set -e
-          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-qpr1-s2-release/clang-r450784e.tar.gz"
-          echo "=== 下载 Clang: $CLANG_URL ==="
-          wget -q --show-progress "$CLANG_URL" -O clang.tar.gz
-          if [ ! -s clang.tar.gz ]; then
-            echo "❌ 官方源下载失败，尝试备用源..."
-            CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20240212-release/Clang-14.0.6-20240212.tar.gz"
-            wget -q --show-progress "$CLANG_URL" -O clang.tar.gz
+          URL1="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-qpr1-s2-release/clang-r450784e.tar.gz"
+          URL2="https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20240212-release/Clang-14.0.6-20240212.tar.gz"
+          echo "=== 尝试官方源 ==="
+          if ! wget -q "$URL1" -O clang.tar.gz; then
+            echo "=== 官方源失败，切换到 GitHub 备用源 ==="
+            wget -q "$URL2" -O clang.tar.gz
           fi
-          echo "=== 解压 Clang ==="
           mkdir -p clang
           tar -xzf clang.tar.gz -C clang
           echo "CLANG_PATH=$PWD/clang/bin" >> "$GITHUB_ENV"
-          echo "=== Clang 版本 ==="
           $PWD/clang/bin/clang --version
 
       - name: Cache ccache
@@ -72,7 +77,6 @@ jobs:
           key: ccache-pdrm00
           restore-keys: ccache-pdrm00-
 
-      # ── Clone 源码 ─────────────────────────────────────
       - name: Clone kernel source
         run: |
           git clone ${{ env.KERNEL_REPO }} kernel \
@@ -91,30 +95,40 @@ jobs:
             find kernel/arch/arm64/configs -name '*defconfig*'
             exit 1
           fi
-          echo "✓ 使用 defconfig: $DEFCONFIG"
+          echo "✓ defconfig: $DEFCONFIG"
 
-      # ── KernelSU-Next 集成 ─────────────────────────────
+      # ── KernelSU-Next ───────────────────────────────────
       - name: Integrate KernelSU-Next
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          echo "=== drivers/kernelsu 内容 ==="
           ls -la drivers/kernelsu/ | head -10
 
-      - name: Patch defconfig for Manual Hooks
+      # ── 一次注入所有 defconfig 修复 ─────────────────────
+      - name: Patch defconfig (KSU + LSE)
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
           DEFCONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG }}"
           {
             echo ""
-            echo "# KernelSU-Next Manual Hooks (CI added)"
+            echo "# ===== CI 注入的配置 ====="
+            echo "# KernelSU-Next"
             echo "CONFIG_KSU=y"
-            echo "CONFIG_KSU_MANUAL_HOOK=y"
+            if [ "${{ github.event.inputs.KSU_HOOK_MODE }}" = "kprobes" ]; then
+              echo "CONFIG_KSU_KPROBES_HOOK=y"
+            else
+              echo "CONFIG_KSU_MANUAL_HOOK=y"
+            fi
+            echo "# 关闭 LSE atomics（clang 13 + 4.19 内核不兼容）"
+            echo "# CONFIG_ARM64_LSE_ATOMICS is not set"
           } >> "$DEFCONFIG_FILE"
-          tail -5 "$DEFCONFIG_FILE"
+          echo "=== 追加后的文件末尾 ==="
+          tail -15 "$DEFCONFIG_FILE"
 
-      # ── 编译 ───────────────────────────────────────────
+      # ── 编译 ────────────────────────────────────────────
       - name: Compile kernel
         id: compile
         continue-on-error: true
@@ -128,45 +142,78 @@ jobs:
           set -o pipefail
           cd kernel
           export PATH="$CLANG_PATH:$PATH"
+          LOG=${{ github.workspace }}/compile.log
 
-          echo "===== [1/3] 清理 out 目录 ====="
+          echo "===== [1/3] 清理 out =====" | tee $LOG
           rm -rf out
 
-          echo "===== [2/3] defconfig: ${{ env.DEFCONFIG }} ====="
-          make O=out ARCH=arm64 CC="ccache clang" ${{ env.DEFCONFIG }} 2>&1 || {
+          echo "===== [2/3] defconfig =====" | tee -a $LOG
+          make O=out ARCH=arm64 CC="ccache clang" ${{ env.DEFCONFIG }} 2>&1 | tee -a $LOG || {
             echo "❌ defconfig 失败"; exit 1;
           }
 
-          echo "=== 确认 KSU 配置 ==="
-          grep -E "KSU|KPROBES" out/.config || echo "⚠ 未找到 KSU 配置"
+          echo "=== 关键配置确认 ===" | tee -a $LOG
+          grep -E "KSU|LSE_ATOMICS|KPROBES" out/.config | tee -a $LOG
 
-          echo "===== [3/3] 编译内核 ====="
+          echo "===== [3/3] 编译内核 =====" | tee -a $LOG
           make O=out ARCH=arm64 -j$(nproc) \
-            CC="ccache clang" LLVM=1 LLVM_IAS=1 2>&1
+            CC="ccache clang" LLVM=1 LLVM_IAS=1 2>&1 | tee -a $LOG
           STATUS=${PIPESTATUS[0]}
           if [ $STATUS -ne 0 ]; then
-            echo "❌ 内核编译失败 (exit=$STATUS)"
+            echo "❌ 编译失败 (exit=$STATUS)" | tee -a $LOG
             exit 1
           fi
-          echo "✓ 内核编译成功"
+          echo "✓ 编译成功" | tee -a $LOG
 
-      # ── 失败时打印日志 ─────────────────────────────────
-      - name: Print compile error if failed
+      # ── 失败时输出所有诊断信息 ─────────────────────────
+      - name: Print all diagnostics on failure
         if: steps.compile.outcome == 'failure'
         run: |
+          echo "############################################################"
+          echo "#                                                          #"
+          echo "#   编译失败。以下是所有诊断信息，请全部复制给我。          #"
+          echo "#                                                          #"
+          echo "############################################################"
+          echo ""
           echo "============================================================"
-          echo "  编译失败，完整错误如下："
+          echo "  [1/5] 编译日志最后 500 行"
+          echo "============================================================"
+          tail -500 ${{ github.workspace }}/compile.log || true
+          echo ""
+          echo "============================================================"
+          echo "  [2/5] 检查 KernelSU-Next 钩子状态"
           echo "============================================================"
           cd kernel
-          make O=out ARCH=arm64 CC="ccache clang" LLVM=1 LLVM_IAS=1 2>&1 | tail -200
+          echo "--- fs/exec.c 中的 ksu_handle ---"
+          grep -n "ksu_handle" fs/exec.c 2>/dev/null || echo "  (无)"
+          echo "--- kernel/reboot.c 中的 ksu_handle ---"
+          grep -n "ksu_handle" kernel/reboot.c 2>/dev/null || echo "  (无)"
+          echo ""
+          echo "--- Kbuild:171 上下文 ---"
+          sed -n '160,180p' drivers/kernelsu/Kbuild
+          echo ""
           echo "============================================================"
-          echo "  manual hook 缺失检查："
-          grep -n "ksu_handle" fs/exec.c kernel/reboot.c 2>/dev/null || echo "  （fs/exec.c / kernel/reboot.c 中无 ksu_handle）"
+          echo "  [3/5] 检查 .config 中的 KSU / LSE 配置"
           echo "============================================================"
+          grep -E "KSU|LSE_ATOMICS|KPROBES|ARM64_LSE" out/.config 2>/dev/null || echo "  (.config 不存在)"
+          echo ""
+          echo "============================================================"
+          echo "  [4/5] LSE atomic 相关源文件是否存在"
+          echo "============================================================"
+          ls -la arch/arm64/include/asm/atomic_lse.h arch/arm64/include/asm/atomic_ll_sc.h 2>&1 || true
+          echo ""
+          echo "============================================================"
+          echo "  [5/5] Kbuild 检查哪一项失败"
+          echo "============================================================"
+          grep -n "KSU_MANUAL_HOOK\|KSU_KPROBES_HOOK\|No hooks" drivers/kernelsu/Kbuild 2>/dev/null || echo "  (未找到)"
+          echo ""
+          echo "############################################################"
+          echo "#   诊断结束"
+          echo "############################################################"
           exit 1
 
-      # ── 上传产物 ───────────────────────────────────────
-      - name: Collect artifacts
+      # ── 打包 ────────────────────────────────────────────
+      - name: Collect artifacts (diagnostic)
         if: always()
         run: |
           ls -la kernel/out/arch/arm64/boot/ 2>&1 || true
