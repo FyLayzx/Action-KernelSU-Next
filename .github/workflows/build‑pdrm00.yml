@@ -21,7 +21,6 @@ permissions:
 
 env:
   KERNEL_REPO: https://github.com/FyLayzx/kernel_oneplus_sm8250
-  CLANG_VERSION: clang-r450784e
 
 jobs:
   build:
@@ -47,24 +46,30 @@ jobs:
             python3 python-is-python3 cpio lz4 xz-utils ccache \
             android-sdk-libsparse-utils patch
 
-      # ── 下载 AOSP Clang ─────────────────────────────────
+      # ── 下载 AOSP Clang（修正版） ───────────────────────
       - name: Download AOSP Clang
         run: |
-          wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-13.0.0_r3/${{ env.CLANG_VERSION }}.tar.gz" -O clang.tar.gz
+          set -e
+          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-qpr1-s2-release/clang-r450784e.tar.gz"
+          echo "=== 下载 Clang: $CLANG_URL ==="
+          wget -q --show-progress "$CLANG_URL" -O clang.tar.gz
           if [ ! -s clang.tar.gz ]; then
-            echo "⚠ 官方源失败，尝试 GitHub 备用源"
-            wget -q "https://github.com/ZyCromerZ/Clang/releases/download/${{ env.CLANG_VERSION }}/${{ env.CLANG_VERSION }}.tar.gz" -O clang.tar.gz
+            echo "❌ 官方源下载失败，尝试备用源..."
+            CLANG_URL="https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20240212-release/Clang-14.0.6-20240212.tar.gz"
+            wget -q --show-progress "$CLANG_URL" -O clang.tar.gz
           fi
+          echo "=== 解压 Clang ==="
           mkdir -p clang
           tar -xzf clang.tar.gz -C clang
           echo "CLANG_PATH=$PWD/clang/bin" >> "$GITHUB_ENV"
+          echo "=== Clang 版本 ==="
           $PWD/clang/bin/clang --version
 
       - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-pdrm00-${{ env.CLANG_VERSION }}
+          key: ccache-pdrm00
           restore-keys: ccache-pdrm00-
 
       # ── Clone 源码 ─────────────────────────────────────
@@ -150,13 +155,12 @@ jobs:
         if: steps.compile.outcome == 'failure'
         run: |
           echo "============================================================"
-          echo "  编译失败，完整错误如下（请复制给我）："
+          echo "  编译失败，完整错误如下："
           echo "============================================================"
           cd kernel
-          # 重新跑一次 make 拿最新错误（不 -j，方便看上下文）
           make O=out ARCH=arm64 CC="ccache clang" LLVM=1 LLVM_IAS=1 2>&1 | tail -200
           echo "============================================================"
-          echo "  mainline hook 缺失检查："
+          echo "  manual hook 缺失检查："
           grep -n "ksu_handle" fs/exec.c kernel/reboot.c 2>/dev/null || echo "  （fs/exec.c / kernel/reboot.c 中无 ksu_handle）"
           echo "============================================================"
           exit 1
