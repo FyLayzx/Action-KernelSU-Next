@@ -1,4 +1,5 @@
 name: Build pdrm00 SM8250-4.19 KernelSU-Next
+
 on:
   workflow_dispatch:
     inputs:
@@ -7,17 +8,22 @@ on:
         required: true
         default: main
       KERNEL_CONFIG:
-        description: defconfig名称
+        description: defconfig 名称
         required: true
         default: pdrm00_defconfig
       KSUNEXT_ENABLED:
-        description: 启用KernelSU-Next
+        description: 启用 KernelSU-Next
         type: boolean
         default: true
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
+
     steps:
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
@@ -32,52 +38,109 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update -y
-          sudo apt install -y git make bc bison flex libssl-dev libelf-dev zip curl wget
+          sudo apt install -y \
+            git make bc bison flex libssl-dev libelf-dev zip curl wget \
+            python3 python-is-python3 cpio lz4 xz-utils ccache
 
-      - name: Download clang-r450784e (mirror)
+      # ── 工具链 ─────────────────────────────────────────────
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-pdrm00-${{ github.sha }}
+          restore-keys: |
+            ccache-pdrm00-
+
+      - name: Download clang-r450784e
         run: |
-          git clone https://github.com/ZyCromerZ/Clang --depth=1 --branch clang-r450784e clang
-          echo "CLANG_PATH=$PWD/clang/bin" >> $GITHUB_ENV
+          git clone https://github.com/ZyCromerZ/Clang \
+            --depth=1 --branch clang-r450784e clang
+          echo "CLANG_PATH=$PWD/clang/bin" >> "$GITHUB_ENV"
 
+      # ── 源码 ─────────────────────────────────────────────
       - name: Clone kernel source
         run: |
-          git clone https://github.com/FyLayzx/kernel_oneplus_sm8250 kernel --branch ${{ github.event.inputs.KERNEL_BRANCH }} --depth=1
+          git clone https://github.com/FyLayzx/kernel_oneplus_sm8250 kernel \
+            --branch ${{ github.event.inputs.KERNEL_BRANCH }} --depth=1
 
       - name: Integrate KernelSU-Next
-        if: github.event.inputs.KSUNEXT_ENABLED == 'true'
+        if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
+        working-directory: kernel
         run: |
-          cd kernel
           curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
 
+      # ── 编译 ─────────────────────────────────────────────
       - name: Compile kernel
+        working-directory: kernel
+        env:
+          ARCH: arm64
+          SUBARCH: arm64
+          CLANG_TRIPLE: aarch64-linux-gnu-
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CROSS_COMPILE_ARM32: arm-linux-gnueabi-
         run: |
-          cd kernel
-          export PATH="$PATH:${{ env.CLANG_PATH }}"
-          export ARCH=arm64
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          make mrproper
-          make ${{ github.event.inputs.KERNEL_CONFIG }}
-          make -j$(nproc) LLVM=1 LLVM_IAS=1 CC=clang
+          export PATH="$CLANG_PATH:$PATH"
+          export CC="ccache clang"
+          make O=out ARCH=arm64 CC="ccache clang" mrproper
+          make O=out ARCH=arm64 CC="ccache clang" \
+            ${{ github.event.inputs.KERNEL_CONFIG }}
+          make O=out ARCH=arm64 -j$(nproc) \
+            CC="ccache clang" LLVM=1 LLVM_IAS=1
 
-      - name: Package AnyKernel3
+      # ── 打包 AnyKernel3 ─────────────────────────────────
+      - name: Clone and prepare AnyKernel3
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1
-          rm -rf AnyKernel3/.git
-          cp kernel/arch/arm64/boot/Image AnyKernel3/
-          # 复制dtb，pdrm00需要dtb，缺少会黑屏
+          rm -rf AnyKernel3/.git AnyKernel3/.github
+          # 写入设备专用的 anykernel.sh
+          cat > AnyKernel3/anykernel.sh <<'EOF'
+          properties() { '
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=OnePlus8T
+          device.name2=OnePlus8
+          device.name3=kebab
+          device.name4=instantnoodle
+          device.name5=instantnoodlep
+          supported.versions=
+          supported.patchlevels=
+          '; }
+          BLOCK=boot;
+          IS_SLOT_DEVICE=1;
+          RAMDISK_MOUNT_POINT=/;
+          EOF
+          echo "任意内核脚本已写入"
+
+      - name: Copy kernel artifacts into AnyKernel3
+        run: |
+          # Image
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
+          # dtb 在 4.19 高通内核里生成到 arch/arm64/boot/dts/qcom/
           mkdir -p AnyKernel3/dtb
-          cp kernel/arch/arm64/boot/dts/vendor/qcom/*.dtb AnyKernel3/dtb/ || true
+          find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} AnyKernel3/dtb/ \;
+          # dtbo（如果该设备需要，通常需要单独 flash dtbo 分区，这里也打进去备用）
+          find kernel/out/arch/arm64/boot -name 'dtbo.img' -exec cp {} AnyKernel3/ \; 2>/dev/null || true
+          ls -la AnyKernel3/
+          ls -la AnyKernel3/dtb/ | head
+
+      - name: Package AnyKernel3 zip
+        run: |
           cd AnyKernel3
-          zip -r AnyKernel3-pdrm00.zip .
+          zip -r9 ../AnyKernel3-pdrm00.zip . -x '*.git*'
 
       - name: Upload AnyKernel3 zip
         uses: actions/upload-artifact@v4
         with:
           name: AnyKernel3-pdrm00
-          path: AnyKernel3/AnyKernel3-pdrm00.zip
+          path: AnyKernel3-pdrm00.zip
+          if-no-files-found: error
 
       - name: Upload raw Image
         uses: actions/upload-artifact@v4
         with:
           name: raw-Image-pdrm00
-          path: kernel/arch/arm64/boot/Image
+          path: kernel/out/arch/arm64/boot/Image
+          if-no-files-found: error
