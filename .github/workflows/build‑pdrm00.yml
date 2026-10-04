@@ -8,7 +8,7 @@ on:
         required: true
         default: main
       KERNEL_CONFIG:
-        description: defconfig 名称（高通 4.19 通常在 vendor/ 下）
+        description: defconfig 名称（自动检测）
         required: true
         default: vendor/pdrm00_defconfig
       KSUNEXT_ENABLED:
@@ -40,21 +40,21 @@ jobs:
           sudo apt update -y
           sudo apt install -y \
             git make bc bison flex libssl-dev libelf-dev zip curl wget \
-            python3 python-is-python3 cpio lz4 xz-utils ccache
+            python3 python-is-python3 cpio lz4 xz-utils ccache \
+            android-sdk-libsparse-utils
 
       # ── 工具链 ─────────────────────────────────────────────
       - name: Cache ccache
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ccache-pdrm00-${{ github.sha }}
+          key: ccache-pdrm00
           restore-keys: |
-            ccache-pdrm00-
+            ccache-pdrm00
 
-      - name: Download clang-r450784e
+      - name: Download clang (proton-clang)
         run: |
-          git clone https://github.com/ZyCromerZ/Clang \
-            --depth=1 --branch clang-r450784e clang
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
           echo "CLANG_PATH=$PWD/clang/bin" >> "$GITHUB_ENV"
 
       # ── 源码 ─────────────────────────────────────────────
@@ -63,11 +63,28 @@ jobs:
           git clone https://github.com/FyLayzx/kernel_oneplus_sm8250 kernel \
             --branch ${{ github.event.inputs.KERNEL_BRANCH }} --depth=1
 
+      - name: Locate defconfig
+        working-directory: kernel
+        run: |
+          DEFCONFIG_INPUT="${{ github.event.inputs.KERNEL_CONFIG }}"
+          if [ -f "arch/arm64/configs/$DEFCONFIG_INPUT" ]; then
+            echo "DEFCONFIG=$DEFCONFIG_INPUT" >> "$GITHUB_ENV"
+            echo "✓ 找到 defconfig: arch/arm64/configs/$DEFCONFIG_INPUT"
+          elif [ -f "arch/arm64/configs/vendor/$DEFCONFIG_INPUT" ]; then
+            echo "DEFCONFIG=vendor/$DEFCONFIG_INPUT" >> "$GITHUB_ENV"
+            echo "✓ 找到 defconfig: arch/arm64/configs/vendor/$DEFCONFIG_INPUT"
+          else
+            echo "✗ 在 arch/arm64/configs/ 下未找到 $DEFCONFIG_INPUT"
+            echo "可用的 defconfig 列表："
+            ls arch/arm64/configs/vendor/
+            exit 1
+          fi
+
       - name: Integrate KernelSU-Next
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         working-directory: kernel
         run: |
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
 
       # ── 编译 ─────────────────────────────────────────────
       - name: Compile kernel
@@ -82,7 +99,7 @@ jobs:
           export PATH="$CLANG_PATH:$PATH"
           make O=out ARCH=arm64 CC="ccache clang" mrproper
           make O=out ARCH=arm64 CC="ccache clang" \
-            ${{ github.event.inputs.KERNEL_CONFIG }}
+            ${{ env.DEFCONFIG }}
           make O=out ARCH=arm64 -j$(nproc) \
             CC="ccache clang" LLVM=1 LLVM_IAS=1
 
@@ -98,23 +115,22 @@ jobs:
           do.systemless=1
           do.cleanup=1
           do.cleanuponabort=0
-          device.name1=OnePlus8T
-          device.name2=OnePlus8
-          device.name3=kebab
-          device.name4=instantnoodle
-          device.name5=instantnoodlep
+          device.name1=kebab
+          device.name2=instantnoodle
+          device.name3=instantnoodlep
           supported.versions=
           supported.patchlevels=
           '; }
-          BLOCK=boot;
-          IS_SLOT_DEVICE=1;
-          RAMDISK_MOUNT_POINT=/;
+          block=boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
           EOF
 
       - name: Copy kernel artifacts into AnyKernel3
         run: |
           cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
           mkdir -p AnyKernel3/dtb
+          # 4.19 高通内核 dtb 生成在 out/arch/arm64/boot/dts/qcom/
           find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} AnyKernel3/dtb/ \;
           echo "=== AnyKernel3 内容 ==="
           ls -la AnyKernel3/
@@ -126,18 +142,28 @@ jobs:
           cd AnyKernel3
           zip -r9 ../AnyKernel3-pdrm00.zip . -x '*.git*'
 
-      # ── 打包 dtbo（独立镜像） ────────────────────────────
-      - name: Collect dtbo image
+      # ── 打包 dtbo（使用 mkdtimg，独立镜像） ─────────────
+      - name: Generate dtbo.img with mkdtimg
         run: |
           mkdir -p dtbo-out
-          # 4.19 高通内核通常生成 dtbo.img 到 out/arch/arm64/boot/
-          if [ -f kernel/out/arch/arm64/boot/dtbo.img ]; then
-            cp kernel/out/arch/arm64/boot/dtbo.img dtbo-out/
-            echo "✓ 找到 dtbo.img"
-          else
-            echo "✗ 未找到 dtbo.img，尝试从 dts 目录构建路径查找..."
-            find kernel/out -name 'dtbo.img' -exec cp {} dtbo-out/ \; || true
+          # 查找生成的 .dtb 文件
+          DTB_DIR=$(find kernel/out/arch/arm64/boot/dts -name '*.dtb' -printf '%h\n' | head -1)
+          if [ -z "$DTB_DIR" ]; then
+            echo "✗ 未找到 dtb 文件，无法生成 dtbo.img"
+            exit 0
           fi
+          # 查找设备对应的 dtbo dtb 文件（通常以设备代号命名）
+          DTBO_FILES=$(find "$DTB_DIR" -name '*kebab*.dtbo' -o -name '*kebab*.dtb' 2>/dev/null | head -20)
+          if [ -z "$DTBO_FILES" ]; then
+            # 如果没有专门 dtbo 文件，尝试用所有 dtb 生成
+            DTBO_FILES=$(find "$DTB_DIR" -name '*.dtb' | head -20)
+          fi
+          echo "用于生成 dtbo 的文件："
+          echo "$DTBO_FILES"
+          mkdtimg create dtbo-out/dtbo.img \
+            --page_size=4096 \
+            $DTBO_FILES
+          echo "✓ dtbo.img 生成成功"
           ls -la dtbo-out/
 
       - name: Package dtbo zip
