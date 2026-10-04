@@ -1,242 +1,217 @@
-name: Diagnose KernelSU-Next Hooks for OOS13.1
+name: test
 
 on:
   workflow_dispatch:
+    inputs:
+      KERNEL_BRANCH:
+        description: 内核源码分支
+        required: false
+        default: 'OOS13.1'
+      KERNEL_CONFIG:
+        description: defconfig 名称
+        required: true
+        default: kona-perf_defconfig
+      KSUNEXT_ENABLED:
+        description: 启用 KernelSU-Next
+        type: boolean
+        default: true
+      KSU_HOOK_MODE:
+        description: KSU hook 模式
+        required: true
+        type: choice
+        options:
+          - kprobes
+          - manual
+        default: kprobes
 
 permissions:
   contents: read
 
 env:
   KERNEL_REPO: https://github.com/FyLayzx/kernel_oneplus_sm8250
-  KERNEL_BRANCH: OOS13.1
 
 jobs:
-  diagnose:
+  test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
 
     steps:
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
-          root-reserve-mb: 4096
-          temp-reserve-mb: 1024
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
           remove-codeql: 'true'
 
-      - name: Install minimal deps
+      - name: Install dependencies
         run: |
           sudo apt update -y
-          sudo apt install -y git curl patch
+          sudo apt install -y \
+            git make bc bison flex libssl-dev libelf-dev zip curl wget \
+            python3 python-is-python3 cpio lz4 xz-utils ccache \
+            android-sdk-libsparse-utils patch
 
-      # ============================================================
-      # 1. Clone 内核源码
-      # ============================================================
+      # ── Clang 工具链 ─────────────────────────────────────
+      - name: Download AOSP Clang
+        run: |
+          set -e
+          URL1="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-qpr1-s2-release/clang-r450784e.tar.gz"
+          URL2="https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20240212-release/Clang-14.0.6-20240212.tar.gz"
+          if ! wget -q "$URL1" -O clang.tar.gz; then
+            echo "官方源失败，切换备用源"
+            wget -q "$URL2" -O clang.tar.gz
+          fi
+          mkdir -p clang
+          tar -xzf clang.tar.gz -C clang
+          echo "CLANG_PATH=$PWD/clang/bin" >> "$GITHUB_ENV"
+          $PWD/clang/bin/clang --version
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-pdrm00
+          restore-keys: ccache-pdrm00-
+
       - name: Clone kernel source
         run: |
-          git clone ${{ env.KERNEL_REPO }} kernel --branch ${{ env.KERNEL_BRANCH }} --depth=1
+          git clone ${{ env.KERNEL_REPO }} kernel \
+            --branch ${{ github.event.inputs.KERNEL_BRANCH }} --depth=1
 
-      # ============================================================
-      # 2. 集成 KernelSU-Next（legacy 模式）
-      # ============================================================
-      - name: Integrate KernelSU-Next (legacy)
+      - name: Locate defconfig
+        run: |
+          DEFCONFIG_INPUT="${{ github.event.inputs.KERNEL_CONFIG }}"
+          if [ -f "kernel/arch/arm64/configs/$DEFCONFIG_INPUT" ]; then
+            echo "DEFCONFIG=$DEFCONFIG_INPUT" >> "$GITHUB_ENV"
+          elif [ -f "kernel/arch/arm64/configs/vendor/$DEFCONFIG_INPUT" ]; then
+            echo "DEFCONFIG=vendor/$DEFCONFIG_INPUT" >> "$GITHUB_ENV"
+          else
+            echo "✗ 未找到 $DEFCONFIG_INPUT"
+            find kernel/arch/arm64/configs -name '*defconfig*'
+            exit 1
+          fi
+          echo "✓ defconfig: $DEFCONFIG"
+
+      # ── KernelSU-Next 集成 ───────────────────────────────
+      - name: Integrate KernelSU-Next
+        if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-          echo "=== 集成完成 ==="
+          ls -la drivers/kernelsu/ | head -10
 
-      # ============================================================
-      # 3. 【关键】打印 Kbuild 的全部内容
-      #    这样我能看到第 171 行的完整逻辑
-      # ============================================================
-      - name: DUMP Kbuild (full)
-        run: |
-          echo "############################################################"
-          echo "#  drivers/kernelsu/Kbuild 全文"
-          echo "############################################################"
-          cat -n kernel/drivers/kernelsu/Kbuild
-          echo "############################################################"
-          echo "#  Kbuild 结束"
-          echo "############################################################"
-
-      # ============================================================
-      # 4. 打印 Kconfig，看有哪些配置项
-      # ============================================================
-      - name: DUMP Kconfig
-        run: |
-          echo "############################################################"
-          echo "#  drivers/kernelsu/Kconfig 全文"
-          echo "############################################################"
-          cat -n kernel/drivers/kernelsu/Kconfig
-          echo "############################################################"
-
-      # ============================================================
-      # 5. 在 ksu 源码里搜索 hook 相关的定义
-      #    找到 Kbuild 检查的变量到底在哪定义
-      # ============================================================
-      - name: Search hook definitions in ksu source
-        run: |
-          cd kernel/drivers/kernelsu
-          echo "############################################################"
-          echo "#  搜索 MANUAL_HOOK / KPROBES_HOOK / KSU_HOOK / HAS_HOOK"
-          echo "############################################################"
-          grep -rn "MANUAL_HOOK\|KPROBES_HOOK\|KSU_HOOK\|HAS_HOOK\|NO_HOOK" \
-            --include="*.c" --include="*.h" --include="Kbuild" --include="Kconfig" \
-            . | head -100
-          echo ""
-          echo "############################################################"
-          echo "#  搜索 KSU_HOOK 相关的 #ifdef / #if 宏"
-          echo "############################################################"
-          grep -rn "KSU_MANUAL_HOOK\|KSU_KPROBES_HOOK" --include="*.h" . | head -50
-
-      # ============================================================
-      # 6. 在内核源码里检查手动钩子是否已存在
-      #    （如果存在，说明源码本身已适配，不需要打补丁）
-      # ============================================================
-      - name: Check existing hooks in kernel source
+      - name: Patch defconfig
+        if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
-          echo "############################################################"
-          echo "#  检查内核源码中是否已存在 ksu_handle_* 调用"
-          echo "############################################################"
-          for f in fs/exec.c kernel/reboot.c fs/stat.c fs/read_write.c fs/open.c; do
+          DEFCONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG }}"
+          {
             echo ""
-            echo "--- $f ---"
-            grep -n "ksu_handle" "$f" 2>/dev/null || echo "  （未找到 ksu_handle）"
-          done
-          echo ""
-          echo "############################################################"
-          echo "#  全局搜索 ksu_handle_ 函数调用"
-          echo "############################################################"
-          grep -rn "ksu_handle_" --include="*.c" --include="*.h" . 2>/dev/null | head -30
+            echo "# ===== CI 注入 ====="
+            echo "CONFIG_KSU=y"
+            if [ "${{ github.event.inputs.KSU_HOOK_MODE }}" = "kprobes" ]; then
+              echo "CONFIG_KSU_KPROBES_HOOK=y"
+            else
+              echo "CONFIG_KSU_MANUAL_HOOK=y"
+            fi
+            echo "# CONFIG_ARM64_LSE_ATOMICS is not set"
+          } >> "$DEFCONFIG_FILE"
+          tail -10 "$DEFCONFIG_FILE"
 
-      # ============================================================
-      # 7. 下载官方 syscall hooks 补丁
-      # ============================================================
-      - name: Download official syscall hooks patch
-        run: |
-          echo "############################################################"
-          echo "#  下载官方 min_scope_syscall_hooks_v1.4.patch"
-          echo "############################################################"
-          curl -LSs "https://github.com/KernelSU-Next/kernel_patches/raw/main/syscall_hook/min_scope_syscall_hooks_v1.4.patch" \
-            -o /tmp/ksu_hooks.patch
-          echo "=== 下载完成，大小: $(wc -c < /tmp/ksu_hooks.patch) 字节 ==="
-          echo ""
-          echo "############################################################"
-          echo "#  补丁中涉及的文件列表"
-          echo "############################################################"
-          grep -E "^\+\+\+ " /tmp/ksu_hooks.patch || echo "补丁格式异常"
-
-      # ============================================================
-      # 8. 尝试应用补丁，打印详细结果
-      # ============================================================
-      - name: Try apply patch (dry run)
-        run: |
-          cd kernel
-          echo "############################################################"
-          echo "#  git apply --check（预检，不实际改动）"
-          echo "############################################################"
-          git apply --check /tmp/ksu_hooks.patch
-          echo "=== 预检结果: exit=$? ==="
-          echo ""
-          echo "############################################################"
-          echo "#  patch --dry-run（预检）"
-          echo "############################################################"
-          patch -p1 --dry-run < /tmp/ksu_hooks.patch || true
-
-      # ============================================================
-      # 9. 真正应用补丁（不使用 git apply，因为会整体回滚）
-      #    使用 patch -p1 并允许部分失败
-      # ============================================================
-      - name: Actually apply patch (allow partial)
+      # ── 编译 ────────────────────────────────────────────
+      - name: Compile kernel
+        id: compile
         continue-on-error: true
+        env:
+          ARCH: arm64
+          SUBARCH: arm64
+          CLANG_TRIPLE: aarch64-linux-gnu-
+          CROSS_COMPILE: aarch64-linux-gnu-
+          CROSS_COMPILE_COMPAT: arm-linux-gnueabi-
         run: |
+          set -o pipefail
           cd kernel
-          echo "############################################################"
-          echo "#  实际应用补丁（patch -p1，允许部分成功）"
-          echo "############################################################"
-          patch -p1 < /tmp/ksu_hooks.patch || true
-          echo ""
-          echo "############################################################"
-          echo "#  应用后的 .rej 文件列表（被拒绝的 hunk）"
-          echo "############################################################"
-          find . -name '*.rej' -type f | while read f; do
-            echo ""
-            echo "============================================================"
-            echo "  被拒绝的 hunk: $f"
-            echo "============================================================"
-            cat -n "$f"
-          done
-          echo ""
-          echo "############################################################"
-          echo "#  如果 .rej 为空，说明补丁全部应用成功"
-          echo "############################################################"
+          export PATH="$CLANG_PATH:$PATH"
+          LOG=${{ github.workspace }}/compile.log
 
-      # ============================================================
-      # 10. 验证钩子函数是否已插入
-      # ============================================================
-      - name: Verify hooks after patch
-        run: |
-          cd kernel
-          echo "############################################################"
-          echo "#  补丁后钩子函数验证"
-          echo "############################################################"
-          for f in fs/exec.c kernel/reboot.c fs/stat.c fs/read_write.c fs/open.c; do
-            echo ""
-            echo "--- $f ---"
-            grep -n "ksu_handle" "$f" 2>/dev/null || echo "  ❌ 未找到 ksu_handle"
-          done
+          echo "===== [1/3] 清理 out =====" | tee $LOG
+          rm -rf out
 
-      # ============================================================
-      # 11. 打印 Kbuild 在打了补丁之后，还是否会报错
-      #     手动触发 Kbuild:171 那段逻辑
-      # ============================================================
-      - name: Check what Kbuild:171 checks
-        run: |
-          cd kernel/drivers/kernelsu
-          echo "############################################################"
-          echo "#  Kbuild 第 160-180 行（上下文）"
-          echo "############################################################"
-          sed -n '155,185p' Kbuild | cat -n
-          echo ""
-          echo "############################################################"
-          echo "#  Kbuild 里所有 ifeq / ifdef / ifndef 附近的 KSU 变量"
-          echo "############################################################"
-          grep -n "ifeq\|ifdef\|ifndef\|KSU" Kbuild | head -60
+          echo "===== [2/3] defconfig =====" | tee -a $LOG
+          make O=out ARCH=arm64 CC="ccache clang" ${{ env.DEFCONFIG }} 2>&1 | tee -a $LOG || {
+            echo "❌ defconfig 失败"; exit 1;
+          }
 
-      # ============================================================
-      # 12. 最终总结
-      # ============================================================
-      - name: FINAL SUMMARY
-        if: always()
-        run: |
-          echo "============================================================"
-          echo "                     诊断总结"
-          echo "============================================================"
-          echo ""
-          echo "1) 官方补丁是否成功应用？"
-          if [ -f kernel/fs/exec.c ]; then
-            if grep -q "ksu_handle_execve" kernel/fs/exec.c; then
-              echo "   ✅ fs/exec.c 中已包含 ksu_handle_execve"
-            else
-              echo "   ❌ fs/exec.c 中未包含 ksu_handle_execve"
-            fi
-            if grep -q "ksu_handle_sys_reboot" kernel/kernel/reboot.c 2>/dev/null; then
-              echo "   ✅ kernel/reboot.c 中已包含 ksu_handle_sys_reboot"
-            else
-              echo "   ❌ kernel/reboot.c 中未包含 ksu_handle_sys_reboot"
-            fi
+          echo "=== 关键配置确认 ===" | tee -a $LOG
+          grep -E "KSU|LSE_ATOMICS|KPROBES|ARM64_LSE" out/.config | tee -a $LOG
+
+          echo "===== [3/3] 编译内核 =====" | tee -a $LOG
+          make O=out ARCH=arm64 -j$(nproc) \
+            CC="ccache clang" LLVM=1 LLVM_IAS=1 2>&1 | tee -a $LOG
+          STATUS=${PIPESTATUS[0]}
+          if [ $STATUS -ne 0 ]; then
+            echo "❌ 编译失败 (exit=$STATUS)" | tee -a $LOG
+            exit 1
           fi
+          echo "✓ 编译成功" | tee -a $LOG
+
+      # ── 失败时输出所有诊断 ─────────────────────────────
+      - name: Print all diagnostics on failure
+        if: steps.compile.outcome == 'failure'
+        run: |
+          echo "############################################################"
+          echo "#         编译失败，请复制以下全部内容发给我                #"
+          echo "############################################################"
           echo ""
-          echo "2) 被拒绝的 hunk 数量:"
-          find kernel -name '*.rej' 2>/dev/null | wc -l
-          echo ""
-          echo "3) 请把上面这几段输出复制给我:"
-          echo "   - DUMP Kbuild 全文"
-          echo "   - DUMP Kconfig 全文"
-          echo "   - Search hook definitions 的输出"
-          echo "   - Actually apply patch 部分的 .rej 内容"
-          echo "   - FINAL SUMMARY"
           echo "============================================================"
+          echo "  [1/6] 编译日志最后 500 行"
+          echo "============================================================"
+          tail -500 ${{ github.workspace }}/compile.log || true
+          echo ""
+          echo "============================================================"
+          echo "  [2/6] 编译日志最后 100 行中的 error 行"
+          echo "============================================================"
+          grep -i "error" ${{ github.workspace }}/compile.log | tail -100 || echo "(无 error 行)"
+          echo ""
+          echo "============================================================"
+          echo "  [3/6] 检查 KSU 钩子状态"
+          echo "============================================================"
+          cd kernel
+          echo "--- fs/exec.c ---"
+          grep -n "ksu_handle" fs/exec.c 2>/dev/null || echo "  (无)"
+          echo "--- kernel/reboot.c ---"
+          grep -n "ksu_handle" kernel/reboot.c 2>/dev/null || echo "  (无)"
+          echo "--- drivers/kernelsu/Kbuild:160-180 ---"
+          sed -n '160,180p' drivers/kernelsu/Kbuild
+          echo ""
+          echo "============================================================"
+          echo "  [4/6] .config 中的 KSU / LSE 配置"
+          echo "============================================================"
+          grep -E "KSU|LSE_ATOMICS|KPROBES|ARM64_LSE" out/.config 2>/dev/null || echo "  (.config 不存在)"
+          echo ""
+          echo "============================================================"
+          echo "  [5/6] 编译产物检查"
+          echo "============================================================"
+          ls -la out/arch/arm64/boot/ 2>&1 || true
+          find out -name '*.dtb' 2>&1 | head -20 || true
+          find out -name '*.dtbo' 2>&1 | head -20 || true
+          echo ""
+          echo "============================================================"
+          echo "  [6/6] 最终判定"
+          echo "============================================================"
+          if grep -q "KernelSU-Next: No hooks were defined" ${{ github.workspace }}/compile.log; then
+            echo "❌ 原因: KernelSU-Next 钩子缺失"
+          elif grep -q "unknown register name" ${{ github.workspace }}/compile.log; then
+            echo "❌ 原因: Clang LSE atomic 编译错误"
+          elif grep -q "error:" ${{ github.workspace }}/compile.log; then
+            echo "❌ 原因: 其他编译错误，详见 [1/6] 和 [2/6]"
+          else
+            echo "⚠ 未匹配到已知错误类型，请手动检查 [1/6]"
+          fi
+          echo "############################################################"
+          echo "#   诊断结束，请复制上面全部内容                            #"
+          echo "############################################################"
+          exit 1
