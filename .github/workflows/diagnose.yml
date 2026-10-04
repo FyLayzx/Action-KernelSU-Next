@@ -15,14 +15,6 @@ on:
         description: 启用 KernelSU-Next
         type: boolean
         default: true
-      KSU_HOOK_MODE:
-        description: KSU hook 模式
-        required: true
-        type: choice
-        options:
-          - kprobes
-          - manual
-        default: kprobes
 
 permissions:
   contents: read
@@ -54,7 +46,6 @@ jobs:
             python3 python-is-python3 cpio lz4 xz-utils ccache \
             android-sdk-libsparse-utils patch
 
-      # ── Clang 工具链 ─────────────────────────────────────
       - name: Download AOSP Clang
         run: |
           set -e
@@ -95,13 +86,52 @@ jobs:
           fi
           echo "✓ defconfig: $DEFCONFIG"
 
-      # ── KernelSU-Next 集成 ───────────────────────────────
       - name: Integrate KernelSU-Next
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
           ls -la drivers/kernelsu/ | head -10
+
+      # ============================================================
+      # 【新增】修复 strscpy_pad 命名不匹配
+      # ============================================================
+      - name: Fix strscpy_pad → __strscpy_pad
+        if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
+        run: |
+          cd kernel
+          echo "############################################################"
+          echo "# 修复前：kernel_compat.h 第 80-110 行"
+          echo "############################################################"
+          sed -n '80,110p' drivers/kernelsu/compat/kernel_compat.h | cat -n
+
+          echo ""
+          echo "############################################################"
+          echo "# 步骤 1: 删除（注释掉）KernelSU-Next 自定义的 __strscpy_pad 函数"
+          echo "# 原因: 内核已有 __strscpy_pad，重复定义会导致冲突"
+          echo "############################################################"
+          sed -i '/static inline ssize_t __strscpy_pad/,/^}/ s/^/\/\/ KSU-CI-DISABLED: /' \
+            drivers/kernelsu/compat/kernel_compat.h
+
+          echo ""
+          echo "############################################################"
+          echo "# 步骤 2: 把 kernelsu 目录下所有 strscpy_pad 替换为 __strscpy_pad"
+          echo "# \b 保证不会误伤 __strscpy_pad（前面是下划线）"
+          echo "############################################################"
+          find drivers/kernelsu -type f \( -name '*.c' -o -name '*.h' \) -print0 | \
+            xargs -0 sed -i 's/\bstrscpy_pad\b/__strscpy_pad/g'
+
+          echo ""
+          echo "############################################################"
+          echo "# 修复后：kernel_compat.h 第 80-110 行"
+          echo "############################################################"
+          sed -n '80,110p' drivers/kernelsu/compat/kernel_compat.h | cat -n
+
+          echo ""
+          echo "############################################################"
+          echo "# 剩余 strscpy_pad 引用（应全部是 __strscpy_pad）"
+          echo "############################################################"
+          grep -rn "strscpy_pad" drivers/kernelsu/ | head -30
 
       - name: Patch defconfig
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
@@ -112,16 +142,11 @@ jobs:
             echo ""
             echo "# ===== CI 注入 ====="
             echo "CONFIG_KSU=y"
-            if [ "${{ github.event.inputs.KSU_HOOK_MODE }}" = "kprobes" ]; then
-              echo "CONFIG_KSU_KPROBES_HOOK=y"
-            else
-              echo "CONFIG_KSU_MANUAL_HOOK=y"
-            fi
+            echo "CONFIG_KSU_KPROBES_HOOK=y"
             echo "# CONFIG_ARM64_LSE_ATOMICS is not set"
           } >> "$DEFCONFIG_FILE"
           tail -10 "$DEFCONFIG_FILE"
 
-      # ── 编译 ────────────────────────────────────────────
       - name: Compile kernel
         id: compile
         continue-on-error: true
@@ -145,9 +170,6 @@ jobs:
             echo "❌ defconfig 失败"; exit 1;
           }
 
-          echo "=== 关键配置确认 ===" | tee -a $LOG
-          grep -E "KSU|LSE_ATOMICS|KPROBES|ARM64_LSE" out/.config | tee -a $LOG
-
           echo "===== [3/3] 编译内核 =====" | tee -a $LOG
           make O=out ARCH=arm64 -j$(nproc) \
             CC="ccache clang" LLVM=1 LLVM_IAS=1 2>&1 | tee -a $LOG
@@ -158,60 +180,40 @@ jobs:
           fi
           echo "✓ 编译成功" | tee -a $LOG
 
-      # ── 失败时输出所有诊断 ─────────────────────────────
       - name: Print all diagnostics on failure
         if: steps.compile.outcome == 'failure'
         run: |
           echo "############################################################"
-          echo "#         编译失败，请复制以下全部内容发给我                #"
+          echo "#   编译失败，请复制以下全部内容                            #"
           echo "############################################################"
           echo ""
           echo "============================================================"
-          echo "  [1/6] 编译日志最后 500 行"
+          echo "  [1/4] 所有 error 行"
           echo "============================================================"
-          tail -500 ${{ github.workspace }}/compile.log || true
+          grep -i "error:" ${{ github.workspace }}/compile.log | head -100 || echo "(无)"
           echo ""
           echo "============================================================"
-          echo "  [2/6] 编译日志最后 100 行中的 error 行"
+          echo "  [2/4] 编译日志最后 300 行"
           echo "============================================================"
-          grep -i "error" ${{ github.workspace }}/compile.log | tail -100 || echo "(无 error 行)"
+          tail -300 ${{ github.workspace }}/compile.log || true
           echo ""
           echo "============================================================"
-          echo "  [3/6] 检查 KSU 钩子状态"
+          echo "  [3/4] 修复后的 kernel_compat.h（第 1-120 行）"
           echo "============================================================"
-          cd kernel
-          echo "--- fs/exec.c ---"
-          grep -n "ksu_handle" fs/exec.c 2>/dev/null || echo "  (无)"
-          echo "--- kernel/reboot.c ---"
-          grep -n "ksu_handle" kernel/reboot.c 2>/dev/null || echo "  (无)"
-          echo "--- drivers/kernelsu/Kbuild:160-180 ---"
-          sed -n '160,180p' drivers/kernelsu/Kbuild
+          sed -n '1,120p' kernel/drivers/kernelsu/compat/kernel_compat.h | cat -n
           echo ""
           echo "============================================================"
-          echo "  [4/6] .config 中的 KSU / LSE 配置"
+          echo "  [4/4] kernelsu 里所有 strscpy_pad 出现位置"
           echo "============================================================"
-          grep -E "KSU|LSE_ATOMICS|KPROBES|ARM64_LSE" out/.config 2>/dev/null || echo "  (.config 不存在)"
+          grep -rn "strscpy_pad" kernel/drivers/kernelsu/ || echo "(无)"
           echo ""
-          echo "============================================================"
-          echo "  [5/6] 编译产物检查"
-          echo "============================================================"
-          ls -la out/arch/arm64/boot/ 2>&1 || true
-          find out -name '*.dtb' 2>&1 | head -20 || true
-          find out -name '*.dtbo' 2>&1 | head -20 || true
-          echo ""
-          echo "============================================================"
-          echo "  [6/6] 最终判定"
-          echo "============================================================"
-          if grep -q "KernelSU-Next: No hooks were defined" ${{ github.workspace }}/compile.log; then
-            echo "❌ 原因: KernelSU-Next 钩子缺失"
-          elif grep -q "unknown register name" ${{ github.workspace }}/compile.log; then
-            echo "❌ 原因: Clang LSE atomic 编译错误"
-          elif grep -q "error:" ${{ github.workspace }}/compile.log; then
-            echo "❌ 原因: 其他编译错误，详见 [1/6] 和 [2/6]"
-          else
-            echo "⚠ 未匹配到已知错误类型，请手动检查 [1/6]"
-          fi
           echo "############################################################"
-          echo "#   诊断结束，请复制上面全部内容                            #"
+          echo "#   诊断结束"
           echo "############################################################"
           exit 1
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          echo "=== boot 目录 ==="
+          ls -la kernel/out/arch/arm64/boot/ 2>&1 || true
