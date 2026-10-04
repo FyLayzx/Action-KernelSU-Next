@@ -8,9 +8,9 @@ on:
         required: true
         default: main
       KERNEL_CONFIG:
-        description: defconfig 名称
+        description: defconfig 名称（高通 4.19 通常在 vendor/ 下）
         required: true
-        default: pdrm00_defconfig
+        default: vendor/pdrm00_defconfig
       KSUNEXT_ENABLED:
         description: 启用 KernelSU-Next
         type: boolean
@@ -80,19 +80,17 @@ jobs:
           CROSS_COMPILE_ARM32: arm-linux-gnueabi-
         run: |
           export PATH="$CLANG_PATH:$PATH"
-          export CC="ccache clang"
           make O=out ARCH=arm64 CC="ccache clang" mrproper
           make O=out ARCH=arm64 CC="ccache clang" \
             ${{ github.event.inputs.KERNEL_CONFIG }}
           make O=out ARCH=arm64 -j$(nproc) \
             CC="ccache clang" LLVM=1 LLVM_IAS=1
 
-      # ── 打包 AnyKernel3 ─────────────────────────────────
+      # ── 打包 AnyKernel3（boot 分区） ─────────────────────
       - name: Clone and prepare AnyKernel3
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1
           rm -rf AnyKernel3/.git AnyKernel3/.github
-          # 写入设备专用的 anykernel.sh
           cat > AnyKernel3/anykernel.sh <<'EOF'
           properties() { '
           do.devicecheck=1
@@ -112,18 +110,15 @@ jobs:
           IS_SLOT_DEVICE=1;
           RAMDISK_MOUNT_POINT=/;
           EOF
-          echo "任意内核脚本已写入"
 
       - name: Copy kernel artifacts into AnyKernel3
         run: |
-          # Image
           cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
-          # dtb 在 4.19 高通内核里生成到 arch/arm64/boot/dts/qcom/
           mkdir -p AnyKernel3/dtb
           find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} AnyKernel3/dtb/ \;
-          # dtbo（如果该设备需要，通常需要单独 flash dtbo 分区，这里也打进去备用）
-          find kernel/out/arch/arm64/boot -name 'dtbo.img' -exec cp {} AnyKernel3/ \; 2>/dev/null || true
+          echo "=== AnyKernel3 内容 ==="
           ls -la AnyKernel3/
+          echo "=== dtb 数量 ==="
           ls -la AnyKernel3/dtb/ | head
 
       - name: Package AnyKernel3 zip
@@ -131,12 +126,44 @@ jobs:
           cd AnyKernel3
           zip -r9 ../AnyKernel3-pdrm00.zip . -x '*.git*'
 
+      # ── 打包 dtbo（独立镜像） ────────────────────────────
+      - name: Collect dtbo image
+        run: |
+          mkdir -p dtbo-out
+          # 4.19 高通内核通常生成 dtbo.img 到 out/arch/arm64/boot/
+          if [ -f kernel/out/arch/arm64/boot/dtbo.img ]; then
+            cp kernel/out/arch/arm64/boot/dtbo.img dtbo-out/
+            echo "✓ 找到 dtbo.img"
+          else
+            echo "✗ 未找到 dtbo.img，尝试从 dts 目录构建路径查找..."
+            find kernel/out -name 'dtbo.img' -exec cp {} dtbo-out/ \; || true
+          fi
+          ls -la dtbo-out/
+
+      - name: Package dtbo zip
+        run: |
+          cd dtbo-out
+          if [ -f dtbo.img ]; then
+            zip -r9 ../dtbo-pdrm00.zip dtbo.img
+            echo "✓ dtbo-pdrm00.zip 已生成"
+          else
+            echo "⚠ 无 dtbo.img，跳过打包"
+          fi
+
+      # ── 上传 ─────────────────────────────────────────────
       - name: Upload AnyKernel3 zip
         uses: actions/upload-artifact@v4
         with:
           name: AnyKernel3-pdrm00
           path: AnyKernel3-pdrm00.zip
           if-no-files-found: error
+
+      - name: Upload dtbo zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtbo-pdrm00
+          path: dtbo-pdrm00.zip
+          if-no-files-found: warn
 
       - name: Upload raw Image
         uses: actions/upload-artifact@v4
