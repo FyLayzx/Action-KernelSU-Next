@@ -1,4 +1,4 @@
-name: Build pdrm00 SM8250-4.19 KernelSU-Next
+name: Build OnePlus 8T OOS13.1 KernelSU-Next
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       KERNEL_CONFIG:
         description: defconfig 名称
         required: true
-        default: kona-perf_defconfig
+        default: vendor/kona-perf_defconfig
       KSUNEXT_ENABLED:
         description: 启用 KernelSU-Next
         type: boolean
@@ -21,6 +21,7 @@ permissions:
 
 env:
   KERNEL_REPO: https://github.com/FyLayzx/kernel_oneplus_sm8250
+  CLANG_URL: "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-qpr1-s2-release/clang-r450784e.tar.gz"
 
 jobs:
   build:
@@ -49,11 +50,9 @@ jobs:
       - name: Download AOSP Clang
         run: |
           set -e
-          URL1="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-qpr1-s2-release/clang-r450784e.tar.gz"
-          URL2="https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20240212-release/Clang-14.0.6-20240212.tar.gz"
-          if ! wget -q "$URL1" -O clang.tar.gz; then
-            echo "官方源失败，切换备用源"
-            wget -q "$URL2" -O clang.tar.gz
+          if ! wget -q "$CLANG_URL" -O clang.tar.gz; then
+            echo "官方源失败，尝试备用源..."
+            wget -q "https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20240212-release/Clang-14.0.6-20240212.tar.gz" -O clang.tar.gz
           fi
           mkdir -p clang
           tar -xzf clang.tar.gz -C clang
@@ -183,7 +182,7 @@ jobs:
           exit 1
 
       # ============================================================
-      # 打包 AnyKernel3（只放 Image，让 AK3 从原 boot 提取 dtb/ramdisk）
+      # 打包 AnyKernel3（借鉴参考工作流：只放 Image，让 AK3 从原 boot 提取 dtb/ramdisk）
       # ============================================================
       - name: Package AnyKernel3 (only Image)
         if: steps.compile.outcome == 'success'
@@ -215,7 +214,7 @@ supported.patchlevels=
 
 # shell variables
 block=/dev/block/bootdevice/by-name/boot;
-is_slot_device=0;
+is_slot_device=auto;
 ramdisk_compression=auto;
 patch_vbmeta_flag=auto;
 
