@@ -46,14 +46,12 @@ jobs:
             python3 python-is-python3 cpio lz4 xz-utils ccache \
             android-sdk-libsparse-utils patch
 
-      # ── Clang ────────────────────────────────────────────
       - name: Download AOSP Clang
         run: |
           set -e
           URL1="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-qpr1-s2-release/clang-r450784e.tar.gz"
           URL2="https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20240212-release/Clang-14.0.6-20240212.tar.gz"
           if ! wget -q "$URL1" -O clang.tar.gz; then
-            echo "官方源失败，切换备用源"
             wget -q "$URL2" -O clang.tar.gz
           fi
           mkdir -p clang
@@ -87,24 +85,62 @@ jobs:
           fi
           echo "✓ defconfig: $DEFCONFIG"
 
-      # ── KernelSU-Next ────────────────────────────────────
+      # ── KernelSU-Next 集成 ────────────────────────────────
       - name: Integrate KernelSU-Next
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-          ls -la drivers/kernelsu/ | head -10
+          echo ""
+          echo "=== 探测 kernelsu 源码位置 ==="
+          echo "drivers/kernelsu 符号链接指向: $(readlink -f drivers/kernelsu 2>/dev/null || echo '不是符号链接')"
+          echo "---"
+          echo "KernelSU-Next 目录:"
+          ls -la KernelSU-Next/ 2>&1 | head -20
 
+      # ── 修复 strscpy_pad（稳健版，支持符号链接）────────
       - name: Fix strscpy_pad compatibility
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
-          echo "=== 修复 strscpy_pad → __strscpy_pad ==="
-          # 在 kernelsu 目录里替换（不碰内核其他源码）
-          find drivers/kernelsu -type f \( -name '*.c' -o -name '*.h' \) -print0 \
-            | xargs -0 sed -i 's/\bstrscpy_pad\b/__strscpy_pad/g'
-          echo "=== 验证替换结果 ==="
-          grep -rn "strscpy_pad" drivers/kernelsu/ | head -20 || echo "(无 strscpy_pad 残留)"
+          echo "######## 修复 strscpy_pad 开始 ########"
+
+          # 使用 find -L 跟随符号链接，查找所有 kernel_compat.h
+          echo "=== 查找所有 kernel_compat.h 文件（跟随符号链接）==="
+          COMPAT_FILES=$(find -L . -name 'kernel_compat.h' 2>/dev/null)
+          if [ -z "$COMPAT_FILES" ]; then
+            echo "❌ 未找到任何 kernel_compat.h 文件"
+            echo "=== 检查 drivers/kernelsu 链接状态 ==="
+            ls -la drivers/kernelsu
+            echo "=== 检查 KernelSU-Next 目录 ==="
+            ls -la KernelSU-Next/kernel/compat/ 2>&1 || true
+            exit 1
+          fi
+          echo "找到以下文件:"
+          echo "$COMPAT_FILES"
+
+          # 逐个文件修复
+          echo "$COMPAT_FILES" | while read -r FILE; do
+            [ -f "$FILE" ] || continue
+            echo ""
+            echo "=== 处理文件: $FILE ==="
+
+            # 步骤 1：把 strscpy_pad 替换为 __strscpy_pad
+            echo "--- 替换前第 85-95 行 ---"
+            sed -n '85,95p' "$FILE" | cat -n
+
+            # 使用 \b 确保只替换独立的 strscpy_pad，不误伤 __strscpy_pad
+            sed -i 's/\bstrscpy_pad\b/__strscpy_pad/g' "$FILE"
+
+            echo "--- 替换后第 85-95 行 ---"
+            sed -n '85,95p' "$FILE" | cat -n
+
+            echo "--- 残留检查 ---"
+            grep -n "strscpy_pad" "$FILE" || echo "  (无残留)"
+          done
+
+          echo ""
+          echo "######## 修复 strscpy_pad 完成 ########"
 
       - name: Patch defconfig
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
@@ -157,28 +193,43 @@ jobs:
       - name: Print errors on failure
         if: steps.compile.outcome == 'failure'
         run: |
+          echo "############################################################"
+          echo "#   编译失败，请复制以下全部内容发我                        #"
+          echo "############################################################"
+          echo ""
           echo "============================================================"
-          echo "  编译失败。以下是关键诊断："
+          echo "  [1/4] 所有 error 行（前 100 条）"
           echo "============================================================"
+          grep -i "error:" ${{ github.workspace }}/compile.log | head -100 || echo "(无)"
           echo ""
-          echo "=== 错误行（前 50 条）==="
-          grep -i "error:" ${{ github.workspace }}/compile.log | head -50 || echo "(无)"
+          echo "============================================================"
+          echo "  [2/4] 编译日志最后 300 行"
+          echo "============================================================"
+          tail -300 ${{ github.workspace }}/compile.log || true
           echo ""
-          echo "=== 编译日志最后 200 行 ==="
-          tail -200 ${{ github.workspace }}/compile.log
+          echo "============================================================"
+          echo "  [3/4] 检查 kernel_compat.h 修复状态"
+          echo "============================================================"
+          find -L kernel -name 'kernel_compat.h' 2>/dev/null | while read -r f; do
+            echo "--- $f (第 80-110 行) ---"
+            sed -n '80,110p' "$f" | cat -n
+            echo "--- 残留 strscpy_pad ---"
+            grep -n "strscpy_pad" "$f" || echo "  (无)"
+          done
           echo ""
-          echo "=== 编译产物状态 ==="
-          ls -la kernel/out/arch/arm64/boot/ 2>&1 || true
+          echo "============================================================"
+          echo "  [4/4] drivers/kernelsu 链接状态"
+          echo "============================================================"
+          ls -la kernel/drivers/kernelsu 2>&1 || true
+          echo ""
+          echo "############################################################"
           exit 1
 
-      # ── 打包 ─────────────────────────────────────────────
       - name: Collect artifacts
         if: always()
         run: |
           echo "=== boot 目录 ==="
           ls -la kernel/out/arch/arm64/boot/ 2>&1 || true
-          echo "=== Image 检查 ==="
-          ls -la kernel/out/arch/arm64/boot/Image 2>&1 || true
 
       - name: Package AnyKernel3
         if: steps.compile.outcome == 'success'
@@ -202,27 +253,16 @@ jobs:
           is_slot_device=1;
           ramdisk_compression=auto;
           EOF
-
-          # Image
           cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
-
-          # 4.19 高通内核的合并 dtb
           if [ -f kernel/out/arch/arm64/boot/dtb ]; then
             cp kernel/out/arch/arm64/boot/dtb AnyKernel3/dtb
-            echo "✓ 使用合并的 dtb"
           else
             mkdir -p AnyKernel3/dtb
             find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} AnyKernel3/dtb/ \;
-            echo "⚠ 使用分散的 dtb"
           fi
-
-          # dtbo.img
           if [ -f kernel/out/arch/arm64/boot/dtbo.img ]; then
             cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/dtbo.img
-            echo "✓ 包含 dtbo.img"
           fi
-
-          ls -la AnyKernel3/
           cd AnyKernel3 && zip -r9 ../AnyKernel3-pdrm00.zip . -x '*.git*'
 
       - name: Upload AnyKernel3 zip
