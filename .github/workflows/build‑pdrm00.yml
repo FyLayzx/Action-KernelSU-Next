@@ -52,6 +52,7 @@ jobs:
           URL1="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-qpr1-s2-release/clang-r450784e.tar.gz"
           URL2="https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20240212-release/Clang-14.0.6-20240212.tar.gz"
           if ! wget -q "$URL1" -O clang.tar.gz; then
+            echo "官方源失败，切换备用源"
             wget -q "$URL2" -O clang.tar.gz
           fi
           mkdir -p clang
@@ -85,6 +86,7 @@ jobs:
           fi
           echo "✓ defconfig: $DEFCONFIG"
 
+      # ── KernelSU-Next 集成 ────────────────────────────────
       - name: Integrate KernelSU-Next
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
@@ -93,7 +95,39 @@ jobs:
           echo "=== 探测 kernelsu 源码位置 ==="
           ls -la drivers/kernelsu 2>&1 | head -3
 
-      # ── 修复 strscpy_pad 版本门槛（关键修复）───────────
+      # ── 修复 1: register_trace_prio_sys_enter ─────────────
+      - name: Fix register_trace_prio_sys_enter for 4.19
+        if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
+        run: |
+          cd kernel
+          echo "######## 修复 register_trace_prio_sys_enter ########"
+
+          # 查找 hook_manager.c（跟随符号链接）
+          TARGET_FILES=$(find -L . -path '*kernelsu*' -name 'hook_manager.c' 2>/dev/null)
+          if [ -z "$TARGET_FILES" ]; then
+            echo "⚠ 未找到 hook_manager.c，可能 KernelSU-Next 版本较新无需此修复"
+          else
+            echo "$TARGET_FILES" | while read -r f; do
+              [ -f "$f" ] || continue
+              echo ""
+              echo "=== 处理: $f ==="
+
+              echo "--- 修复前搜索 prio_sys_enter ---"
+              grep -n "prio_sys_enter" "$f" || echo "  (无匹配)"
+
+              # 替换为 4.19 内核支持的版本（去掉 prio）
+              sed -i 's/\bregister_trace_prio_sys_enter\b/register_trace_sys_enter/g' "$f"
+              sed -i 's/\bunregister_trace_prio_sys_enter\b/unregister_trace_sys_enter/g' "$f"
+
+              echo "--- 修复后搜索 prio_sys_enter ---"
+              grep -n "prio_sys_enter" "$f" || echo "  (无残留，修复成功)"
+            done
+          fi
+
+          echo ""
+          echo "######## 修复 register_trace_prio_sys_enter 完成 ########"
+
+      # ── 修复 2: strscpy_pad 版本门槛 ──────────────────────
       - name: Fix strscpy_pad version gate
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
@@ -103,7 +137,6 @@ jobs:
           COMPAT_FILES=$(find -L . -name 'kernel_compat.h' 2>/dev/null)
           if [ -z "$COMPAT_FILES" ]; then
             echo "❌ 未找到 kernel_compat.h"
-            find -L . -name 'kernel_compat.h' 2>/dev/null | head
             exit 1
           fi
 
@@ -114,8 +147,7 @@ jobs:
             echo "--- 修改前（第 85-100 行）---"
             sed -n '85,100p' "$f" | cat -n
 
-            # 关键：把 4.14.222 的门槛改到 99.99.99，强制走 #elif 分支（手动 padding）
-            # 4.19 内核没有 strscpy_pad，只能用手动实现
+            # 强制 4.19 内核走 #elif 分支（手动 padding 实现）
             sed -i 's/LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 222)/LINUX_VERSION_CODE >= KERNEL_VERSION(99, 99, 99)/g' "$f"
 
             echo "--- 修改后（第 85-100 行）---"
@@ -123,7 +155,7 @@ jobs:
           done
 
           echo ""
-          echo "######## 修复完成 ########"
+          echo "######## 修复 strscpy_pad 完成 ########"
 
       - name: Patch defconfig
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
@@ -186,9 +218,16 @@ jobs:
           echo "=== [2/3] 编译日志最后 200 行 ==="
           tail -200 ${{ github.workspace }}/compile.log || true
           echo ""
-          echo "=== [3/3] kernel_compat.h 当前状态 ==="
+          echo "=== [3/3] kernelsu 相关文件修复状态 ==="
+          echo "--- hook_manager.c 第 395-410 行 ---"
+          find -L kernel -path '*kernelsu*' -name 'hook_manager.c' 2>/dev/null | while read -r f; do
+            echo "文件: $f"
+            sed -n '395,410p' "$f" | cat -n
+          done
+          echo ""
+          echo "--- kernel_compat.h 第 85-100 行 ---"
           find -L kernel -name 'kernel_compat.h' 2>/dev/null | while read -r f; do
-            echo "--- $f (第 85-100 行) ---"
+            echo "文件: $f"
             sed -n '85,100p' "$f" | cat -n
           done
           echo ""
