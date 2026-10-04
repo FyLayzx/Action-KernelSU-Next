@@ -96,14 +96,14 @@ jobs:
           ls -la drivers/kernelsu 2>&1 | head -3
 
       # ============================================================
-      # 修复 1: register_trace_sys_enter / unregister_trace_sys_enter
-      #          删掉第 3 个参数（INT_MIN），4.19 内核只接受 2 个参数
+      # 修复 1: 处理 register_trace_prio_sys_enter
+      #        4.19 内核没有 prio 版本，替换为普通版本并去掉第 3 参数
       # ============================================================
-      - name: Fix register_trace_sys_enter arguments
+      - name: Fix register_trace_prio_sys_enter (name + arg)
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
-          echo "######## 修复 register_trace_sys_enter 参数 ########"
+          echo "######## 修复 register_trace_prio_sys_enter ########"
 
           TARGET_FILES=$(find -L . -path '*kernelsu*' -name 'hook_manager.c' 2>/dev/null)
           if [ -z "$TARGET_FILES" ]; then
@@ -114,22 +114,28 @@ jobs:
               echo ""
               echo "=== 处理: $f ==="
 
-              echo "--- 修复前 ---"
-              grep -n "register_trace_sys_enter\|unregister_trace_sys_enter" "$f" || echo "  (无匹配)"
+              echo "--- 修复前（所有 trace 相关行）---"
+              grep -n "trace_prio_sys_enter\|trace_sys_enter" "$f" || echo "  (无匹配)"
 
-              # 删除 register_trace_sys_enter(...) 的第 3 个参数（, INT_MIN 或 , 数字）
+              # 第一步：把 register_trace_prio_sys_enter(a, b, c) → register_trace_sys_enter(a, b)
+              #        用正则一次性删除第 3 个参数，同时改掉函数名
+              sed -i -E 's/\bregister_trace_prio_sys_enter\s*\(([^,]+),[[:space:]]*([^,]+),[^)]+\)/register_trace_sys_enter(\1, \2)/g' "$f"
+
+              # 第二步：unregister 同理
+              sed -i -E 's/\bunregister_trace_prio_sys_enter\s*\(([^,]+),[[:space:]]*([^,]+),[^)]+\)/unregister_trace_sys_enter(\1, \2)/g' "$f"
+
+              # 第三步：如果已经是 register_trace_sys_enter 但还有 3 个参数，删掉第 3 个
               sed -i -E 's/(register_trace_sys_enter\([^,]+,[^,]+),[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*\)/\1)/g' "$f"
               sed -i -E 's/(unregister_trace_sys_enter\([^,]+,[^,]+),[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*\)/\1)/g' "$f"
 
-              echo "--- 修复后 ---"
-              grep -n "register_trace_sys_enter\|unregister_trace_sys_enter" "$f" || echo "  (无匹配)"
+              echo "--- 修复后（所有 trace 相关行）---"
+              grep -n "trace_prio_sys_enter\|trace_sys_enter" "$f" || echo "  (无匹配)"
             done
           fi
           echo "######## 完成 ########"
 
       # ============================================================
       # 修复 2: strscpy_pad 版本门槛
-      #          4.19 内核没有 strscpy_pad，强制走手动实现分支
       # ============================================================
       - name: Fix strscpy_pad version gate
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
@@ -211,11 +217,10 @@ jobs:
           echo "=== [2/3] 编译日志最后 200 行 ==="
           tail -200 ${{ github.workspace }}/compile.log || true
           echo ""
-          echo "=== [3/3] kernelsu 关键文件状态 ==="
-          echo "--- hook_manager.c register_trace_sys_enter 相关行 ---"
+          echo "=== [3/3] hook_manager.c trace 相关行 ==="
           find -L kernel -path '*kernelsu*' -name 'hook_manager.c' 2>/dev/null | while read -r f; do
             echo "文件: $f"
-            grep -n "register_trace_sys_enter\|unregister_trace_sys_enter" "$f" || echo "  (无)"
+            grep -n "trace_prio_sys_enter\|trace_sys_enter" "$f" || echo "  (无)"
           done
           echo ""
           echo "--- kernel_compat.h 第 85-100 行 ---"
