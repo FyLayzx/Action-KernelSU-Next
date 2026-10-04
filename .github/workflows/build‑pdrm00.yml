@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       KERNEL_BRANCH:
-        description: 内核源码分支
-        required: true
-        default: main
+        description: 内核源码分支（留空=自动探测默认分支）
+        required: false
+        default: ''
       KERNEL_CONFIG:
-        description: defconfig 名称（不带路径前缀，会自动搜索）
+        description: defconfig 名称（不带路径前缀）
         required: true
         default: pdrm00_defconfig
       KSUNEXT_ENABLED:
@@ -18,6 +18,9 @@ on:
 
 permissions:
   contents: read
+
+env:
+  KERNEL_REPO: https://github.com/FyLayzx/kernel_oneplus_sm8250
 
 jobs:
   build:
@@ -38,17 +41,69 @@ jobs:
       - name: Setup logs directory
         run: |
           mkdir -p ${{ github.workspace }}/logs
-          echo "Workflow 启动时间: $(date -u)" > ${{ github.workspace }}/logs/summary.log
-          echo "输入参数: branch=${{ github.event.inputs.KERNEL_BRANCH }}, config=${{ github.event.inputs.KERNEL_CONFIG }}, ksunext=${{ github.event.inputs.KSUNEXT_ENABLED }}" >> ${{ github.workspace }}/logs/summary.log
+          {
+            echo "Workflow 启动时间: $(date -u)"
+            echo "输入参数: branch='${{ github.event.inputs.KERNEL_BRANCH }}', config='${{ github.event.inputs.KERNEL_CONFIG }}', ksunext=${{ github.event.inputs.KSUNEXT_ENABLED }}"
+          } > ${{ github.workspace }}/logs/summary.log
 
       - name: Install dependencies
         run: |
+          set -o pipefail
           LOG=${{ github.workspace }}/logs/deps.log
           sudo apt update -y 2>&1 | tee $LOG
           sudo apt install -y \
             git make bc bison flex libssl-dev libelf-dev zip curl wget \
             python3 python-is-python3 cpio lz4 xz-utils ccache \
             android-sdk-libsparse-utils 2>&1 | tee -a $LOG
+
+      # ── 关键：先探测仓库所有远程分支 ────────────────────
+      - name: Probe remote branches
+        run: |
+          set -o pipefail
+          LOG=${{ github.workspace }}/logs/branches.log
+          echo "=== 仓库 ${{ env.KERNEL_REPO }} 全部远程分支 ===" | tee $LOG
+          git ls-remote --heads ${{ env.KERNEL_REPO }} 2>&1 | tee -a $LOG
+          echo "" | tee -a $LOG
+          echo "=== 远程 HEAD (默认分支) ===" | tee -a $LOG
+          git ls-remote --symref ${{ env.KERNEL_REPO }} HEAD 2>&1 | tee -a $LOG
+
+      - name: Resolve branch
+        run: |
+          set -o pipefail
+          LOG=${{ github.workspace }}/logs/branches.log
+          INPUT_BRANCH="${{ github.event.inputs.KERNEL_BRANCH }}"
+          # 拉取远程分支列表
+          git ls-remote --heads ${{ env.KERNEL_REPO }} \
+            | awk '{print $2}' | sed 's#refs/heads/##' > /tmp/remote_branches.txt
+          echo "可用分支:" | tee -a $LOG
+          cat /tmp/remote_branches.txt | tee -a $LOG
+
+          if [ -n "$INPUT_BRANCH" ] && grep -qx "$INPUT_BRANCH" /tmp/remote_branches.txt; then
+            CHOSEN="$INPUT_BRANCH"
+            echo "✓ 使用用户指定分支: $CHOSEN" | tee -a $LOG
+          else
+            if [ -n "$INPUT_BRANCH" ]; then
+              echo "⚠ 用户分支 '$INPUT_BRANCH' 不存在" | tee -a $LOG
+            fi
+            # 尝试常见默认分支名
+            for b in main master mainline lineage-22.2 lineage-22.1 lineage-21 lineage-20; do
+              if grep -qx "$b" /tmp/remote_branches.txt; then
+                CHOSEN="$b"; break
+              fi
+            done
+            if [ -z "$CHOSEN" ]; then
+              CHOSEN=$(head -n 1 /tmp/remote_branches.txt)
+              echo "⚠ 自动选取第一个分支: $CHOSEN" | tee -a $LOG
+            else
+              echo "✓ 自动匹配到分支: $CHOSEN" | tee -a $LOG
+            fi
+          fi
+
+          if [ -z "$CHOSEN" ]; then
+            echo "✗ 无法确定分支，请查看 branches.log" | tee -a $LOG
+            exit 1
+          fi
+          echo "KERNEL_BRANCH=$CHOSEN" >> "$GITHUB_ENV"
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -59,6 +114,7 @@ jobs:
 
       - name: Download toolchain (proton-clang)
         run: |
+          set -o pipefail
           LOG=${{ github.workspace }}/logs/toolchain.log
           git clone --depth=1 https://github.com/kdrag0n/proton-clang clang 2>&1 | tee $LOG
           echo "CLANG_PATH=$PWD/clang/bin" >> "$GITHUB_ENV"
@@ -67,51 +123,53 @@ jobs:
 
       - name: Clone kernel source
         run: |
+          set -o pipefail
           LOG=${{ github.workspace }}/logs/clone.log
-          git clone https://github.com/FyLayzx/kernel_oneplus_sm8250 kernel \
-            --branch ${{ github.event.inputs.KERNEL_BRANCH }} --depth=1 2>&1 | tee $LOG
+          echo "=== 即将 clone 分支: ${{ env.KERNEL_BRANCH }} ===" | tee $LOG
+          git clone ${{ env.KERNEL_REPO }} kernel \
+            --branch ${{ env.KERNEL_BRANCH }} --depth=1 2>&1 | tee -a $LOG
           echo "=== 源码树根目录 ===" | tee -a $LOG
           ls -la kernel/ | tee -a $LOG
-          echo "=== arch/arm64/configs/ 内容 ===" | tee -a $LOG
-          ls -la kernel/arch/arm64/configs/ | tee -a $LOG
-          echo "=== arch/arm64/configs/vendor/ 内容（如果存在）===" | tee -a $LOG
+          echo "=== arch/arm64/configs/ ===" | tee -a $LOG
+          ls -la kernel/arch/arm64/configs/ 2>&1 | tee -a $LOG
+          echo "=== arch/arm64/configs/vendor/ ===" | tee -a $LOG
           ls -la kernel/arch/arm64/configs/vendor/ 2>&1 | tee -a $LOG
+          echo "=== 全部 defconfig ===" | tee -a $LOG
+          find kernel/arch/arm64/configs -name '*defconfig*' 2>&1 | tee -a $LOG
 
       - name: Locate defconfig
-        working-directory: kernel
         run: |
+          set -o pipefail
           LOG=${{ github.workspace }}/logs/defconfig.log
           DEFCONFIG_INPUT="${{ github.event.inputs.KERNEL_CONFIG }}"
           echo "=== 搜索 defconfig: $DEFCONFIG_INPUT ===" | tee $LOG
-          if [ -f "arch/arm64/configs/$DEFCONFIG_INPUT" ]; then
+          if [ -f "kernel/arch/arm64/configs/$DEFCONFIG_INPUT" ]; then
             echo "DEFCONFIG=$DEFCONFIG_INPUT" >> "$GITHUB_ENV"
             echo "✓ 找到: arch/arm64/configs/$DEFCONFIG_INPUT" | tee -a $LOG
-          elif [ -f "arch/arm64/configs/vendor/$DEFCONFIG_INPUT" ]; then
+          elif [ -f "kernel/arch/arm64/configs/vendor/$DEFCONFIG_INPUT" ]; then
             echo "DEFCONFIG=vendor/$DEFCONFIG_INPUT" >> "$GITHUB_ENV"
             echo "✓ 找到: arch/arm64/configs/vendor/$DEFCONFIG_INPUT" | tee -a $LOG
           else
             echo "✗ 未找到 $DEFCONFIG_INPUT" | tee -a $LOG
-            echo "=== 全部可用的 defconfig ===" | tee -a $LOG
-            find arch/arm64/configs/ -name '*defconfig*' 2>&1 | tee -a $LOG
+            echo "=== 全部可用 defconfig ===" | tee -a $LOG
+            find kernel/arch/arm64/configs -name '*defconfig*' 2>&1 | tee -a $LOG
             exit 1
           fi
 
       - name: Integrate KernelSU-Next
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
-        working-directory: kernel
         run: |
+          set -o pipefail
           LOG=${{ github.workspace }}/logs/ksunext.log
+          cd kernel
           echo "=== 集成 KernelSU-Next ===" | tee $LOG
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy 2>&1 | tee -a $LOG
           echo "=== drivers/kernelsu 目录内容 ===" | tee -a $LOG
           ls -la drivers/kernelsu/ 2>&1 | tee -a $LOG
-          echo "=== drivers/Kconfig / Makefile 中的 kernelsu 引用 ===" | tee -a $LOG
-          grep -n "kernelsu" drivers/Kconfig drivers/Makefile 2>&1 | tee -a $LOG || echo "未找到 kernelsu 引用"
 
       - name: Compile kernel
         id: compile
         continue-on-error: true
-        working-directory: kernel
         env:
           ARCH: arm64
           SUBARCH: arm64
@@ -121,6 +179,7 @@ jobs:
         run: |
           set -o pipefail
           LOG=${{ github.workspace }}/logs/compile.log
+          cd kernel
           export PATH="$CLANG_PATH:$PATH"
 
           echo "===== [1/3] mrproper =====" | tee $LOG
@@ -128,10 +187,7 @@ jobs:
 
           echo "===== [2/3] defconfig: ${{ env.DEFCONFIG }} =====" | tee -a $LOG
           make O=out ARCH=arm64 CC="ccache clang" ${{ env.DEFCONFIG }} 2>&1 | tee -a $LOG || {
-            echo "❌ defconfig 步骤失败" | tee -a $LOG;
-            echo "=== 源码树中 defconfig 位置 ===" | tee -a $LOG;
-            find arch/arm64/configs -name '*defconfig*' | tee -a $LOG;
-            exit 1;
+            echo "❌ defconfig 步骤失败" | tee -a $LOG; exit 1;
           }
 
           echo "===== [3/3] 编译内核 =====" | tee -a $LOG
@@ -149,18 +205,15 @@ jobs:
         run: |
           LOG=${{ github.workspace }}/logs/artifacts.log
           echo "=== 编译产物路径检查 ===" | tee $LOG
-          echo "--- out/arch/arm64/boot/ ---" | tee -a $LOG
           ls -la kernel/out/arch/arm64/boot/ 2>&1 | tee -a $LOG
-          echo "--- out/arch/arm64/boot/dts/qcom/ (前 40 项) ---" | tee -a $LOG
           ls -la kernel/out/arch/arm64/boot/dts/qcom/ 2>&1 | head -40 | tee -a $LOG
-          echo "--- 查找所有 .dtb ---" | tee -a $LOG
           find kernel/out -name '*.dtb' 2>&1 | tee -a $LOG
-          echo "--- 查找所有 .dtbo ---" | tee -a $LOG
           find kernel/out -name '*.dtbo' 2>&1 | tee -a $LOG
 
       - name: Package AnyKernel3
         if: steps.compile.outcome == 'success'
         run: |
+          set -o pipefail
           LOG=${{ github.workspace }}/logs/package.log
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1 2>&1 | tee $LOG
           rm -rf AnyKernel3/.git AnyKernel3/.github
@@ -184,8 +237,6 @@ jobs:
           cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
           mkdir -p AnyKernel3/dtb
           find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} AnyKernel3/dtb/ \; 2>&1 | tee -a $LOG
-          echo "=== AnyKernel3 内容 ===" | tee -a $LOG
-          ls -la AnyKernel3/ | tee -a $LOG
           cd AnyKernel3
           zip -r9 ../AnyKernel3-pdrm00.zip . -x '*.git*' 2>&1 | tee -a $LOG
 
@@ -193,24 +244,19 @@ jobs:
         if: steps.compile.outcome == 'success'
         continue-on-error: true
         run: |
+          set -o pipefail
           LOG=${{ github.workspace }}/logs/dtbo.log
           mkdir -p dtbo-out
-          echo "=== 查找所有 .dtbo / overlay dtb ===" | tee $LOG
-          find kernel/out/arch/arm64/boot/dts -name '*.dtbo' 2>&1 | tee -a $LOG
           DTBO_FILES=$(find kernel/out/arch/arm64/boot/dts -name '*.dtbo' 2>/dev/null | head -50)
           if [ -z "$DTBO_FILES" ]; then
-            echo "⚠ 未找到 .dtbo 文件，回退使用平台 dtb" | tee -a $LOG
             DTBO_FILES=$(find kernel/out/arch/arm64/boot/dts/qcom -name '*.dtb' 2>/dev/null | head -50)
           fi
-          echo "=== 用于生成 dtbo 的文件 ===" | tee -a $LOG
-          echo "$DTBO_FILES" | tee -a $LOG
+          echo "$DTBO_FILES" | tee $LOG
           if [ -n "$DTBO_FILES" ]; then
             mkdtimg create dtbo-out/dtbo.img --page_size=4096 $DTBO_FILES 2>&1 | tee -a $LOG
-            ls -la dtbo-out/ | tee -a $LOG
             cd dtbo-out && zip -r9 ../dtbo-pdrm00.zip dtbo.img 2>&1 | tee -a $LOG
           fi
 
-      # ── 上传（关键：日志用 always） ──────────────────────
       - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -248,5 +294,5 @@ jobs:
       - name: Fail if compile failed
         if: steps.compile.outcome == 'failure'
         run: |
-          echo "编译步骤失败。请下载 build-logs artifact，把 compile.log 发给我。"
+          echo "编译失败，请下载 build-logs artifact。"
           exit 1
