@@ -52,7 +52,6 @@ jobs:
           URL1="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-qpr1-s2-release/clang-r450784e.tar.gz"
           URL2="https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20240212-release/Clang-14.0.6-20240212.tar.gz"
           if ! wget -q "$URL1" -O clang.tar.gz; then
-            echo "官方源失败，切换备用源"
             wget -q "$URL2" -O clang.tar.gz
           fi
           mkdir -p clang
@@ -80,81 +79,35 @@ jobs:
           elif [ -f "kernel/arch/arm64/configs/vendor/$DEFCONFIG_INPUT" ]; then
             echo "DEFCONFIG=vendor/$DEFCONFIG_INPUT" >> "$GITHUB_ENV"
           else
-            echo "✗ 未找到 $DEFCONFIG_INPUT"
-            find kernel/arch/arm64/configs -name '*defconfig*'
             exit 1
           fi
           echo "✓ defconfig: $DEFCONFIG"
 
-      # ── KernelSU-Next 集成 ────────────────────────────────
       - name: Integrate KernelSU-Next
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-          echo "=== 探测 kernelsu 源码位置 ==="
-          ls -la drivers/kernelsu 2>&1 | head -3
 
-      # ============================================================
-      # 修复 1: 处理 register_trace_prio_sys_enter
-      #        4.19 内核没有 prio 版本，替换为普通版本并去掉第 3 参数
-      # ============================================================
-      - name: Fix register_trace_prio_sys_enter (name + arg)
+      - name: Fix register_trace_prio_sys_enter
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
-          echo "######## 修复 register_trace_prio_sys_enter ########"
-
           TARGET_FILES=$(find -L . -path '*kernelsu*' -name 'hook_manager.c' 2>/dev/null)
-          if [ -z "$TARGET_FILES" ]; then
-            echo "⚠ 未找到 hook_manager.c"
-          else
-            echo "$TARGET_FILES" | while read -r f; do
-              [ -f "$f" ] || continue
-              echo ""
-              echo "=== 处理: $f ==="
+          echo "$TARGET_FILES" | while read -r f; do
+            [ -f "$f" ] || continue
+            sed -i -E 's/\bregister_trace_prio_sys_enter\s*\(([^,]+),[[:space:]]*([^,]+),[^)]+\)/register_trace_sys_enter(\1, \2)/g' "$f"
+            sed -i -E 's/\bunregister_trace_prio_sys_enter\s*\(([^,]+),[[:space:]]*([^,]+),[^)]+\)/unregister_trace_sys_enter(\1, \2)/g' "$f"
+          done
 
-              echo "--- 修复前（所有 trace 相关行）---"
-              grep -n "trace_prio_sys_enter\|trace_sys_enter" "$f" || echo "  (无匹配)"
-
-              # 第一步：把 register_trace_prio_sys_enter(a, b, c) → register_trace_sys_enter(a, b)
-              #        用正则一次性删除第 3 个参数，同时改掉函数名
-              sed -i -E 's/\bregister_trace_prio_sys_enter\s*\(([^,]+),[[:space:]]*([^,]+),[^)]+\)/register_trace_sys_enter(\1, \2)/g' "$f"
-
-              # 第二步：unregister 同理
-              sed -i -E 's/\bunregister_trace_prio_sys_enter\s*\(([^,]+),[[:space:]]*([^,]+),[^)]+\)/unregister_trace_sys_enter(\1, \2)/g' "$f"
-
-              # 第三步：如果已经是 register_trace_sys_enter 但还有 3 个参数，删掉第 3 个
-              sed -i -E 's/(register_trace_sys_enter\([^,]+,[^,]+),[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*\)/\1)/g' "$f"
-              sed -i -E 's/(unregister_trace_sys_enter\([^,]+,[^,]+),[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*\)/\1)/g' "$f"
-
-              echo "--- 修复后（所有 trace 相关行）---"
-              grep -n "trace_prio_sys_enter\|trace_sys_enter" "$f" || echo "  (无匹配)"
-            done
-          fi
-          echo "######## 完成 ########"
-
-      # ============================================================
-      # 修复 2: strscpy_pad 版本门槛
-      # ============================================================
       - name: Fix strscpy_pad version gate
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
-          echo "######## 修复 strscpy_pad 版本门槛 ########"
-
           COMPAT_FILES=$(find -L . -name 'kernel_compat.h' 2>/dev/null)
-          if [ -z "$COMPAT_FILES" ]; then
-            echo "❌ 未找到 kernel_compat.h"
-            exit 1
-          fi
-
           echo "$COMPAT_FILES" | while read -r f; do
-            echo "=== 处理: $f ==="
             sed -i 's/LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 222)/LINUX_VERSION_CODE >= KERNEL_VERSION(99, 99, 99)/g' "$f"
-            sed -n '85,100p' "$f" | cat -n
           done
-          echo "######## 完成 ########"
 
       - name: Patch defconfig
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
@@ -163,14 +116,11 @@ jobs:
           DEFCONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG }}"
           {
             echo ""
-            echo "# ===== CI 注入 ====="
             echo "CONFIG_KSU=y"
             echo "CONFIG_KSU_KPROBES_HOOK=y"
             echo "# CONFIG_ARM64_LSE_ATOMICS is not set"
           } >> "$DEFCONFIG_FILE"
-          tail -10 "$DEFCONFIG_FILE"
 
-      # ── 编译 ─────────────────────────────────────────────
       - name: Compile kernel
         id: compile
         continue-on-error: true
@@ -185,91 +135,78 @@ jobs:
           cd kernel
           export PATH="$CLANG_PATH:$PATH"
           LOG=${{ github.workspace }}/compile.log
-
-          echo "===== [1/3] 清理 out =====" | tee $LOG
           rm -rf out
-
-          echo "===== [2/3] defconfig =====" | tee -a $LOG
-          make O=out ARCH=arm64 CC="ccache clang" ${{ env.DEFCONFIG }} 2>&1 | tee -a $LOG || {
-            echo "❌ defconfig 失败"; exit 1;
-          }
-
-          echo "===== [3/3] 编译内核 =====" | tee -a $LOG
-          make O=out ARCH=arm64 -j$(nproc) \
-            CC="ccache clang" LLVM=1 LLVM_IAS=1 2>&1 | tee -a $LOG
+          make O=out ARCH=arm64 CC="ccache clang" ${{ env.DEFCONFIG }} 2>&1 | tee $LOG || exit 1
+          make O=out ARCH=arm64 -j$(nproc) CC="ccache clang" LLVM=1 LLVM_IAS=1 2>&1 | tee -a $LOG
           STATUS=${PIPESTATUS[0]}
-          if [ $STATUS -ne 0 ]; then
-            echo "❌ 编译失败 (exit=$STATUS)" | tee -a $LOG
-            exit 1
-          fi
-          echo "✓ 编译成功" | tee -a $LOG
+          [ $STATUS -ne 0 ] && exit 1
+          echo "✓ 编译成功"
 
       - name: Print errors on failure
         if: steps.compile.outcome == 'failure'
         run: |
-          echo "############################################################"
-          echo "#   编译失败，请复制以下全部内容发我                        #"
-          echo "############################################################"
-          echo ""
-          echo "=== [1/3] 所有 error 行（前 100 条）==="
-          grep -i "error:" ${{ github.workspace }}/compile.log | head -100 || echo "(无)"
-          echo ""
-          echo "=== [2/3] 编译日志最后 200 行 ==="
-          tail -200 ${{ github.workspace }}/compile.log || true
-          echo ""
-          echo "=== [3/3] hook_manager.c trace 相关行 ==="
-          find -L kernel -path '*kernelsu*' -name 'hook_manager.c' 2>/dev/null | while read -r f; do
-            echo "文件: $f"
-            grep -n "trace_prio_sys_enter\|trace_sys_enter" "$f" || echo "  (无)"
-          done
-          echo ""
-          echo "--- kernel_compat.h 第 85-100 行 ---"
-          find -L kernel -name 'kernel_compat.h' 2>/dev/null | while read -r f; do
-            sed -n '85,100p' "$f" | cat -n
-          done
-          echo ""
-          echo "############################################################"
+          grep -i "error:" ${{ github.workspace }}/compile.log | head -50
+          tail -100 ${{ github.workspace }}/compile.log
           exit 1
 
-      - name: Collect artifacts
-        if: always()
-        run: |
-          echo "=== boot 目录 ==="
-          ls -la kernel/out/arch/arm64/boot/ 2>&1 || true
-
-      - name: Package AnyKernel3
+      # ============================================================
+      # 打包：跟参考工作流一样，只放 Image
+      # ============================================================
+      - name: Package AnyKernel3 (only Image)
         if: steps.compile.outcome == 'success'
         run: |
           git clone https://github.com/osm0sis/AnyKernel3 --depth=1
-          rm -rf AnyKernel3/.git AnyKernel3/.github
-          cat > AnyKernel3/anykernel.sh <<'EOF'
-          properties() { '
-          do.devicecheck=1
-          do.modules=0
-          do.systemless=1
-          do.cleanup=1
-          do.cleanuponabort=0
-          device.name1=kebab
-          device.name2=instantnoodle
-          device.name3=instantnoodlep
-          supported.versions=
-          supported.patchlevels=
-          '; }
-          block=boot;
-          is_slot_device=1;
-          ramdisk_compression=auto;
-          EOF
-          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
-          if [ -f kernel/out/arch/arm64/boot/dtb ]; then
-            cp kernel/out/arch/arm64/boot/dtb AnyKernel3/dtb
+          cd AnyKernel3
+          rm -rf .git .github modules patch ramdisk
+
+          # 只放 Image（压缩为 Image.gz）
+          gzip -9 -c ../kernel/out/arch/arm64/boot/Image > Image.gz
+
+          # 写入 anykernel.sh
+          cat > anykernel.sh <<'AKEOF'
+### AnyKernel3 Ramdisk Mod Script
+## osm0sis @ xda-developers
+
+properties() { '
+kernel.string=pdrm00 KernelSU-Next by CI
+do.devicecheck=0
+do.modules=0
+do.systemless=0
+do.cleanup=1
+do.cleanuponabort=0
+supported.versions=
+supported.patchlevels=
+'; }
+
+# shell variables
+block=/dev/block/bootdevice/by-name/boot;
+is_slot_device=0;
+ramdisk_compression=auto;
+patch_vbmeta_flag=auto;
+
+## AnyKernel methods (DO NOT CHANGE)
+. tools/ak3-core.sh;
+
+## AnyKernel boot install
+dump_boot;
+vbmeta_disable_verification;
+write_boot;
+## end boot install
+AKEOF
+
+          echo "=== 内容清单 ==="
+          ls -la
+          echo ""
+          echo "=== 确认无 dtb/dtbo.img ==="
+          if [ -f dtb ] || [ -f dtbo.img ]; then
+            echo "⚠️ 警告：不应有 dtb/dtbo，请检查！"
           else
-            mkdir -p AnyKernel3/dtb
-            find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} AnyKernel3/dtb/ \;
+            echo "✓ 正确：只有 Image，让 AK3 从原 boot 提取 dtb/ramdisk"
           fi
-          if [ -f kernel/out/arch/arm64/boot/dtbo.img ]; then
-            cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/dtbo.img
-          fi
-          cd AnyKernel3 && zip -r9 ../AnyKernel3-pdrm00.zip . -x '*.git*'
+
+          cd ..
+          zip -r9 AnyKernel3-pdrm00.zip AnyKernel3 -x '*.git*'
+          mv AnyKernel3-pdrm00.zip ./AnyKernel3-pdrm00.zip
 
       - name: Upload AnyKernel3 zip
         if: steps.compile.outcome == 'success'
@@ -286,12 +223,3 @@ jobs:
           name: raw-Image-pdrm00
           path: kernel/out/arch/arm64/boot/Image
           if-no-files-found: error
-
-      - name: Upload dtbo
-        if: steps.compile.outcome == 'success'
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: dtbo-pdrm00
-          path: kernel/out/arch/arm64/boot/dtbo.img
-          if-no-files-found: warn
