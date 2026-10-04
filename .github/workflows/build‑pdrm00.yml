@@ -1,0 +1,83 @@
+name: Build pdrm00 SM8250-4.19 KernelSU-Next
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_BRANCH:
+        description: 内核源码分支
+        required: true
+        default: main
+      KERNEL_CONFIG:
+        description: defconfig名称
+        required: true
+        default: pdrm00_defconfig
+      KSUNEXT_ENABLED:
+        description: 启用KernelSU-Next
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 8192
+          temp-reserve-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+
+      - name: Install dependencies
+        run: |
+          sudo apt update -y
+          sudo apt install -y git make bc bison flex libssl-dev libelf-dev zip curl wget
+
+      - name: Download clang-r450784e (mirror)
+        run: |
+          git clone https://github.com/ZyCromerZ/Clang --depth=1 --branch clang-r450784e clang
+          echo "CLANG_PATH=$PWD/clang/bin" >> $GITHUB_ENV
+
+      - name: Clone kernel source
+        run: |
+          git clone https://github.com/FyLayzx/kernel_oneplus_sm8250 kernel --branch ${{ github.event.inputs.KERNEL_BRANCH }} --depth=1
+
+      - name: Integrate KernelSU-Next
+        if: github.event.inputs.KSUNEXT_ENABLED == 'true'
+        run: |
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next/kernel/setup.sh" | bash -s next
+
+      - name: Compile kernel
+        run: |
+          cd kernel
+          export PATH="$PATH:${{ env.CLANG_PATH }}"
+          export ARCH=arm64
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          make mrproper
+          make ${{ github.event.inputs.KERNEL_CONFIG }}
+          make -j$(nproc) LLVM=1 LLVM_IAS=1 CC=clang
+
+      - name: Package AnyKernel3
+        run: |
+          git clone https://github.com/osm0sis/AnyKernel3 --depth=1
+          rm -rf AnyKernel3/.git
+          cp kernel/arch/arm64/boot/Image AnyKernel3/
+          # 复制dtb，pdrm00需要dtb，缺少会黑屏
+          mkdir -p AnyKernel3/dtb
+          cp kernel/arch/arm64/boot/dts/vendor/qcom/*.dtb AnyKernel3/dtb/ || true
+          cd AnyKernel3
+          zip -r AnyKernel3-pdrm00.zip .
+
+      - name: Upload AnyKernel3 zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: AnyKernel3-pdrm00
+          path: AnyKernel3/AnyKernel3-pdrm00.zip
+
+      - name: Upload raw Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-Image-pdrm00
+          path: kernel/arch/arm64/boot/Image
