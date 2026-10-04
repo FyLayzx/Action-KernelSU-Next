@@ -15,14 +15,6 @@ on:
         description: 启用 KernelSU-Next
         type: boolean
         default: true
-      KSU_HOOK_MODE:
-        description: KSU hook 模式
-        required: true
-        type: choice
-        options:
-          - kprobes
-          - manual
-        default: kprobes
 
 permissions:
   contents: read
@@ -54,15 +46,14 @@ jobs:
             python3 python-is-python3 cpio lz4 xz-utils ccache \
             android-sdk-libsparse-utils patch
 
-      # ── Clang 工具链 ─────────────────────────────────────
+      # ── Clang ────────────────────────────────────────────
       - name: Download AOSP Clang
         run: |
           set -e
           URL1="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-qpr1-s2-release/clang-r450784e.tar.gz"
           URL2="https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20240212-release/Clang-14.0.6-20240212.tar.gz"
-          echo "=== 尝试官方源 ==="
           if ! wget -q "$URL1" -O clang.tar.gz; then
-            echo "=== 官方源失败，切换到 GitHub 备用源 ==="
+            echo "官方源失败，切换备用源"
             wget -q "$URL2" -O clang.tar.gz
           fi
           mkdir -p clang
@@ -81,7 +72,6 @@ jobs:
         run: |
           git clone ${{ env.KERNEL_REPO }} kernel \
             --branch ${{ github.event.inputs.KERNEL_BRANCH }} --depth=1
-          ls -la kernel/arch/arm64/configs/vendor/ | head -20
 
       - name: Locate defconfig
         run: |
@@ -97,38 +87,40 @@ jobs:
           fi
           echo "✓ defconfig: $DEFCONFIG"
 
-      # ── KernelSU-Next ───────────────────────────────────
+      # ── KernelSU-Next ────────────────────────────────────
       - name: Integrate KernelSU-Next
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
-          echo "=== drivers/kernelsu 内容 ==="
           ls -la drivers/kernelsu/ | head -10
 
-      # ── 一次注入所有 defconfig 修复 ─────────────────────
-      - name: Patch defconfig (KSU + LSE)
+      - name: Fix strscpy_pad compatibility
+        if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
+        run: |
+          cd kernel
+          echo "=== 修复 strscpy_pad → __strscpy_pad ==="
+          # 在 kernelsu 目录里替换（不碰内核其他源码）
+          find drivers/kernelsu -type f \( -name '*.c' -o -name '*.h' \) -print0 \
+            | xargs -0 sed -i 's/\bstrscpy_pad\b/__strscpy_pad/g'
+          echo "=== 验证替换结果 ==="
+          grep -rn "strscpy_pad" drivers/kernelsu/ | head -20 || echo "(无 strscpy_pad 残留)"
+
+      - name: Patch defconfig
         if: ${{ github.event.inputs.KSUNEXT_ENABLED == 'true' }}
         run: |
           cd kernel
           DEFCONFIG_FILE="arch/arm64/configs/${{ env.DEFCONFIG }}"
           {
             echo ""
-            echo "# ===== CI 注入的配置 ====="
-            echo "# KernelSU-Next"
+            echo "# ===== CI 注入 ====="
             echo "CONFIG_KSU=y"
-            if [ "${{ github.event.inputs.KSU_HOOK_MODE }}" = "kprobes" ]; then
-              echo "CONFIG_KSU_KPROBES_HOOK=y"
-            else
-              echo "CONFIG_KSU_MANUAL_HOOK=y"
-            fi
-            echo "# 关闭 LSE atomics（clang 13 + 4.19 内核不兼容）"
+            echo "CONFIG_KSU_KPROBES_HOOK=y"
             echo "# CONFIG_ARM64_LSE_ATOMICS is not set"
           } >> "$DEFCONFIG_FILE"
-          echo "=== 追加后的文件末尾 ==="
-          tail -15 "$DEFCONFIG_FILE"
+          tail -10 "$DEFCONFIG_FILE"
 
-      # ── 编译 ────────────────────────────────────────────
+      # ── 编译 ─────────────────────────────────────────────
       - name: Compile kernel
         id: compile
         continue-on-error: true
@@ -152,9 +144,6 @@ jobs:
             echo "❌ defconfig 失败"; exit 1;
           }
 
-          echo "=== 关键配置确认 ===" | tee -a $LOG
-          grep -E "KSU|LSE_ATOMICS|KPROBES" out/.config | tee -a $LOG
-
           echo "===== [3/3] 编译内核 =====" | tee -a $LOG
           make O=out ARCH=arm64 -j$(nproc) \
             CC="ccache clang" LLVM=1 LLVM_IAS=1 2>&1 | tee -a $LOG
@@ -165,60 +154,31 @@ jobs:
           fi
           echo "✓ 编译成功" | tee -a $LOG
 
-      # ── 失败时输出所有诊断信息 ─────────────────────────
-      - name: Print all diagnostics on failure
+      - name: Print errors on failure
         if: steps.compile.outcome == 'failure'
         run: |
-          echo "############################################################"
-          echo "#                                                          #"
-          echo "#   编译失败。以下是所有诊断信息，请全部复制给我。          #"
-          echo "#                                                          #"
-          echo "############################################################"
+          echo "============================================================"
+          echo "  编译失败。以下是关键诊断："
+          echo "============================================================"
           echo ""
-          echo "============================================================"
-          echo "  [1/5] 编译日志最后 500 行"
-          echo "============================================================"
-          tail -500 ${{ github.workspace }}/compile.log || true
+          echo "=== 错误行（前 50 条）==="
+          grep -i "error:" ${{ github.workspace }}/compile.log | head -50 || echo "(无)"
           echo ""
-          echo "============================================================"
-          echo "  [2/5] 检查 KernelSU-Next 钩子状态"
-          echo "============================================================"
-          cd kernel
-          echo "--- fs/exec.c 中的 ksu_handle ---"
-          grep -n "ksu_handle" fs/exec.c 2>/dev/null || echo "  (无)"
-          echo "--- kernel/reboot.c 中的 ksu_handle ---"
-          grep -n "ksu_handle" kernel/reboot.c 2>/dev/null || echo "  (无)"
+          echo "=== 编译日志最后 200 行 ==="
+          tail -200 ${{ github.workspace }}/compile.log
           echo ""
-          echo "--- Kbuild:171 上下文 ---"
-          sed -n '160,180p' drivers/kernelsu/Kbuild
-          echo ""
-          echo "============================================================"
-          echo "  [3/5] 检查 .config 中的 KSU / LSE 配置"
-          echo "============================================================"
-          grep -E "KSU|LSE_ATOMICS|KPROBES|ARM64_LSE" out/.config 2>/dev/null || echo "  (.config 不存在)"
-          echo ""
-          echo "============================================================"
-          echo "  [4/5] LSE atomic 相关源文件是否存在"
-          echo "============================================================"
-          ls -la arch/arm64/include/asm/atomic_lse.h arch/arm64/include/asm/atomic_ll_sc.h 2>&1 || true
-          echo ""
-          echo "============================================================"
-          echo "  [5/5] Kbuild 检查哪一项失败"
-          echo "============================================================"
-          grep -n "KSU_MANUAL_HOOK\|KSU_KPROBES_HOOK\|No hooks" drivers/kernelsu/Kbuild 2>/dev/null || echo "  (未找到)"
-          echo ""
-          echo "############################################################"
-          echo "#   诊断结束"
-          echo "############################################################"
+          echo "=== 编译产物状态 ==="
+          ls -la kernel/out/arch/arm64/boot/ 2>&1 || true
           exit 1
 
-      # ── 打包 ────────────────────────────────────────────
-      - name: Collect artifacts (diagnostic)
+      # ── 打包 ─────────────────────────────────────────────
+      - name: Collect artifacts
         if: always()
         run: |
+          echo "=== boot 目录 ==="
           ls -la kernel/out/arch/arm64/boot/ 2>&1 || true
-          find kernel/out -name '*.dtb' 2>&1 | head -20 || true
-          find kernel/out -name '*.dtbo' 2>&1 | head -20 || true
+          echo "=== Image 检查 ==="
+          ls -la kernel/out/arch/arm64/boot/Image 2>&1 || true
 
       - name: Package AnyKernel3
         if: steps.compile.outcome == 'success'
@@ -242,9 +202,27 @@ jobs:
           is_slot_device=1;
           ramdisk_compression=auto;
           EOF
+
+          # Image
           cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
-          mkdir -p AnyKernel3/dtb
-          find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} AnyKernel3/dtb/ \;
+
+          # 4.19 高通内核的合并 dtb
+          if [ -f kernel/out/arch/arm64/boot/dtb ]; then
+            cp kernel/out/arch/arm64/boot/dtb AnyKernel3/dtb
+            echo "✓ 使用合并的 dtb"
+          else
+            mkdir -p AnyKernel3/dtb
+            find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cp {} AnyKernel3/dtb/ \;
+            echo "⚠ 使用分散的 dtb"
+          fi
+
+          # dtbo.img
+          if [ -f kernel/out/arch/arm64/boot/dtbo.img ]; then
+            cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/dtbo.img
+            echo "✓ 包含 dtbo.img"
+          fi
+
+          ls -la AnyKernel3/
           cd AnyKernel3 && zip -r9 ../AnyKernel3-pdrm00.zip . -x '*.git*'
 
       - name: Upload AnyKernel3 zip
@@ -262,3 +240,12 @@ jobs:
           name: raw-Image-pdrm00
           path: kernel/out/arch/arm64/boot/Image
           if-no-files-found: error
+
+      - name: Upload dtbo
+        if: steps.compile.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: dtbo-pdrm00
+          path: kernel/out/arch/arm64/boot/dtbo.img
+          if-no-files-found: warn
